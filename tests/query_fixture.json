@@ -1,0 +1,87 @@
+{
+  "SHARADAR/SEP?date.gte=2020-08-28&date.lte=2020-08-31&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL": [
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 127.58,
+      "low": 126.0,
+      "high": 131.0,
+      "close": 129.04,
+      "volume": 223506000.0,
+      "closeadj": 125.411,
+      "closeunadj": 129.04
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-28T00:00:00.000",
+      "open": 126.013,
+      "low": 124.578,
+      "high": 126.442,
+      "close": 124.808,
+      "volume": 187630000.0,
+      "closeadj": 121.297,
+      "closeunadj": 499.23
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-28&date.lte=2020-09-01&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL": [
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 132.76,
+      "low": 130.53,
+      "high": 134.8,
+      "close": 134.18,
+      "volume": 150699000.0,
+      "closeadj": 130.406,
+      "closeunadj": 134.18
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 127.58,
+      "low": 126.0,
+      "high": 131.0,
+      "close": 129.04,
+      "volume": 223506000.0,
+      "closeadj": 125.411,
+      "closeunadj": 129.04
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-28T00:00:00.000",
+      "open": 126.013,
+      "low": 124.578,
+      "high": 126.442,
+      "close": 124.808,
+      "volume": 187630000.0,
+      "closeadj": 121.297,
+      "closeunadj": 499.23
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-28&date.lte=2020-08-28&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL": [
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-28T00:00:00.000",
+      "open": 126.013,
+      "low": 124.578,
+      "high": 126.442,
+      "close": 124.808,
+      "volume": 187630000.0,
+      "closeadj": 121.297,
+      "closeunadj": 499.23
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-28&date.lte=2020-08-28&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=MSFT": [
+    {
+      "ticker": "MSFT",
+      "date": "2020-08-28T00:00:00.000",
+      "open": 228.18,
+      "low": 226.58,
+      "high": 230.644,
+      "close": 228.91,
+      "volume": 26293000.0,
+      "closeadj": 219.052,
+      "closeunadj": 228.91
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[project]
+name = "ndl-cache"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=1.4.3",
+    "nasdaq-data-link>=1.0.4",
+    "pandas>=2.3.3",
+    "pyarrow>=22.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
