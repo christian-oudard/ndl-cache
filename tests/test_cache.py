@@ -641,3 +641,83 @@ class TestSetIntersection:
         date_filter = overfetch_call['kwargs'].get('date', {})
         assert date_filter.get('gte') == '2020-08-31'
         assert date_filter.get('lte') == '2020-09-02'
+
+
+class TestFilterSplitting:
+    """Tests for automatic request splitting to stay under page limit."""
+
+    def test_small_request_not_split(self):
+        """Requests under page limit should not be split."""
+        filters = {'ticker': 'AAPL', 'date_gte': '2024-01-01', 'date_lte': '2024-12-31'}
+        chunks = CachedTable._split_filters(filters)
+        assert len(chunks) == 1
+        assert chunks[0] == filters
+
+    def test_multi_ticker_split(self):
+        """Large multi-ticker requests should be split by ticker groups."""
+        # 100 tickers × 252 days = 25,200 rows > 10k limit
+        tickers = [f'T{i:03d}' for i in range(100)]
+        filters = {'ticker': tickers, 'date_gte': '2024-01-01', 'date_lte': '2024-12-31'}
+        chunks = CachedTable._split_filters(filters)
+
+        # Should split into multiple chunks
+        assert len(chunks) > 1
+
+        # Each chunk should have fewer tickers
+        for chunk in chunks:
+            chunk_tickers = chunk.get('ticker')
+            if isinstance(chunk_tickers, list):
+                assert len(chunk_tickers) < 100
+            # Estimate should be under split threshold
+            est = CachedTable._estimate_rows(chunk)
+            assert est < cache.NDL_SPLIT_THRESHOLD
+
+        # All tickers should be covered
+        all_tickers = []
+        for chunk in chunks:
+            t = chunk.get('ticker')
+            if isinstance(t, list):
+                all_tickers.extend(t)
+            else:
+                all_tickers.append(t)
+        assert set(all_tickers) == set(tickers)
+
+    def test_long_date_range_split(self):
+        """Single ticker with very long date range should split by dates."""
+        # 1 ticker × 50 years ≈ 12,600 rows > 10k limit
+        filters = {'ticker': 'AAPL', 'date_gte': '1975-01-01', 'date_lte': '2024-12-31'}
+        chunks = CachedTable._split_filters(filters)
+
+        # Should split into multiple date ranges
+        assert len(chunks) > 1
+
+        # Each chunk should cover non-overlapping date ranges
+        for chunk in chunks:
+            assert chunk['ticker'] == 'AAPL'
+            assert 'date_gte' in chunk
+            assert 'date_lte' in chunk
+            # Estimate should be under split threshold
+            est = CachedTable._estimate_rows(chunk)
+            assert est < cache.NDL_SPLIT_THRESHOLD
+
+    def test_estimate_trading_days(self):
+        """Trading day estimation should be reasonable."""
+        # 1 year ≈ 252 trading days
+        est = CachedTable._estimate_trading_days('2024-01-01', '2024-12-31')
+        assert 250 <= est <= 260
+
+        # 1 month ≈ 21 trading days
+        est = CachedTable._estimate_trading_days('2024-01-01', '2024-01-31')
+        assert 15 <= est <= 25
+
+    def test_estimate_rows(self):
+        """Row estimation should account for tickers and dates."""
+        # Single ticker, 1 year
+        filters = {'ticker': 'AAPL', 'date_gte': '2024-01-01', 'date_lte': '2024-12-31'}
+        est = CachedTable._estimate_rows(filters)
+        assert 250 <= est <= 260
+
+        # 10 tickers, 1 year
+        filters = {'ticker': [f'T{i}' for i in range(10)], 'date_gte': '2024-01-01', 'date_lte': '2024-12-31'}
+        est = CachedTable._estimate_rows(filters)
+        assert 2500 <= est <= 2600

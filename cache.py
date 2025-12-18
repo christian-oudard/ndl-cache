@@ -2,7 +2,23 @@ import pandas as pd
 import nasdaqdatalink as ndl
 from pathlib import Path
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 import duckdb
+import warnings
+
+# Optimal parallelization level based on benchmarking ~10k row requests
+# Higher values hit server-side throttling with diminishing returns
+MAX_FETCH_WORKERS = 4
+
+# NDL API page limit - requests returning more get paginated (slow) or truncated
+NDL_PAGE_LIMIT = 10000
+
+# Split threshold - stay well under page limit so hitting 10k is always an error
+# This buffer accounts for estimation inaccuracy (holidays, new listings, etc.)
+NDL_SPLIT_THRESHOLD = 9000
+
+# Approximate trading days per calendar year
+TRADING_DAYS_PER_YEAR = 252
 
 
 class CachedTable:
@@ -50,8 +66,86 @@ class CachedTable:
         """Derive output columns from immutable data. Override in subclass."""
         raise NotImplementedError
 
+    @staticmethod
+    def _estimate_trading_days(date_gte: str | None, date_lte: str | None) -> int:
+        """Estimate number of trading days in a date range."""
+        if not (date_gte and date_lte):
+            return 1
+        start = datetime.strptime(date_gte, '%Y-%m-%d')
+        end = datetime.strptime(date_lte, '%Y-%m-%d')
+        calendar_days = (end - start).days + 1
+        return max(1, int(calendar_days * TRADING_DAYS_PER_YEAR / 365))
+
+    @staticmethod
+    def _estimate_rows(filters: dict) -> int:
+        """Estimate number of rows a filter set will return."""
+        ticker = filters.get('ticker')
+        n_tickers = len(ticker) if isinstance(ticker, list) else 1
+        est_days = CachedTable._estimate_trading_days(
+            filters.get('date_gte'),
+            filters.get('date_lte')
+        )
+        return n_tickers * est_days
+
+    @staticmethod
+    def _split_filters(filters: dict, max_rows: int = NDL_SPLIT_THRESHOLD) -> list[dict]:
+        """
+        Split a filter set into chunks that each return < max_rows.
+        Splits by tickers first, then by date ranges if needed.
+        """
+        est_rows = CachedTable._estimate_rows(filters)
+        if est_rows < max_rows:
+            return [filters]
+
+        ticker = filters.get('ticker')
+        date_gte = filters.get('date_gte')
+        date_lte = filters.get('date_lte')
+
+        # Strategy 1: Split by tickers
+        if isinstance(ticker, list) and len(ticker) > 1:
+            est_days = CachedTable._estimate_trading_days(date_gte, date_lte)
+            tickers_per_chunk = max(1, max_rows // est_days)
+
+            chunks = []
+            for i in range(0, len(ticker), tickers_per_chunk):
+                chunk_tickers = ticker[i:i + tickers_per_chunk]
+                chunk_filters = {**filters, 'ticker': chunk_tickers if len(chunk_tickers) > 1 else chunk_tickers[0]}
+                # Recursively split if still too large (e.g., very long date range)
+                chunks.extend(CachedTable._split_filters(chunk_filters, max_rows))
+            return chunks
+
+        # Strategy 2: Split by date range (for single ticker with long history)
+        if date_gte and date_lte:
+            start = datetime.strptime(date_gte, '%Y-%m-%d')
+            end = datetime.strptime(date_lte, '%Y-%m-%d')
+            total_days = (end - start).days + 1
+
+            # Calculate days per chunk to stay under max_rows
+            # For single ticker: rows ≈ trading_days ≈ calendar_days * 252/365
+            calendar_days_per_chunk = max(1, int(max_rows * 365 / TRADING_DAYS_PER_YEAR))
+
+            chunks = []
+            chunk_start = start
+            while chunk_start <= end:
+                chunk_end = min(chunk_start + timedelta(days=calendar_days_per_chunk - 1), end)
+                chunk_filters = {
+                    **filters,
+                    'date_gte': chunk_start.strftime('%Y-%m-%d'),
+                    'date_lte': chunk_end.strftime('%Y-%m-%d'),
+                }
+                chunks.append(chunk_filters)
+                chunk_start = chunk_end + timedelta(days=1)
+            return chunks
+
+        # Can't split further
+        return [filters]
+
     def fetch_from_ndl(self, **filters) -> pd.DataFrame:
-        """Fetch data from NDL API."""
+        """
+        Fetch data from NDL API.
+        Uses paginate=True as safety net to never lose data.
+        Warns if pagination was needed (indicates splitting should have prevented this).
+        """
         # Convert our filter format to NDL format
         ndl_filters = {}
         range_filters = {}  # For gte/lte style filters
@@ -69,16 +163,69 @@ class CachedTable:
         # Merge range filters
         ndl_filters.update(range_filters)
 
-        return ndl.get_table(
+        result = ndl.get_table(
             self.table_name,
             qopts={'columns': self.index_columns + self.query_columns},
-            paginate=True,
+            paginate=True,  # Safety net - never lose data
             **ndl_filters
         )
 
-    def sync(self, **filters):
-        """Sync data from NDL to local cache."""
-        queried = self.fetch_from_ndl(**filters)
+        # Track estimation accuracy
+        estimated = self._estimate_rows(filters)
+        actual = len(result)
+
+        # Warn if pagination was needed (splitting should have prevented this)
+        if actual >= NDL_PAGE_LIMIT:
+            warnings.warn(
+                f"NDL request returned {actual} rows (required pagination). "
+                f"Estimated {estimated}, splitting threshold is {NDL_SPLIT_THRESHOLD}. "
+                f"Filters: {filters}",
+                UserWarning
+            )
+        # Warn if estimate was significantly off (>50% error)
+        elif estimated > 0:
+            error_ratio = abs(actual - estimated) / estimated
+            if error_ratio > 0.5 and actual > 100:  # Only care about non-trivial requests
+                warnings.warn(
+                    f"NDL row estimate was off by {error_ratio:.0%}: "
+                    f"estimated {estimated}, got {actual}. Filters: {filters}",
+                    UserWarning
+                )
+
+        return result
+
+    def _fetch_parallel(self, filter_sets: list[dict]) -> pd.DataFrame:
+        """
+        Fetch multiple filter sets in parallel using a worker pool.
+        Workers pull from the queue until all requests are complete.
+        Automatically splits any filter sets that would exceed page limit.
+        Returns combined DataFrame.
+        """
+        if not filter_sets:
+            return pd.DataFrame()
+
+        # Split any oversized filter sets to stay under page limit
+        all_chunks = []
+        for filters in filter_sets:
+            all_chunks.extend(self._split_filters(filters))
+
+        if len(all_chunks) == 1:
+            return self.fetch_from_ndl(**all_chunks[0])
+
+        with ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as executor:
+            results = list(executor.map(lambda f: self.fetch_from_ndl(**f), all_chunks))
+
+        non_empty = [r for r in results if len(r) > 0]
+        if not non_empty:
+            return pd.DataFrame()
+        return pd.concat(non_empty, ignore_index=True)
+
+    def _sync_parallel(self, filter_sets: list[dict]) -> int:
+        """
+        Fetch multiple filter sets in parallel and sync to cache.
+        Returns total rows synced.
+        """
+        queried = self._fetch_parallel(filter_sets)
         if len(queried) == 0:
             return 0
 
@@ -99,6 +246,11 @@ class CachedTable:
         """)
 
         return len(immutable)
+
+    def sync(self, **filters):
+        """Sync data from NDL to local cache. Splits large requests automatically."""
+        # Use parallel fetch with auto-splitting to avoid pagination
+        return self._sync_parallel([filters])
 
     def get_cached(self, **filters) -> pd.DataFrame:
         """Get data from local cache."""
@@ -187,10 +339,15 @@ class CachedTable:
             filters.get('date_gte'),
             filters.get('date_lte')
         )
-        for gap_start, gap_end in gaps:
-            gap_filters = {**filters, 'date_gte': gap_start, 'date_lte': gap_end}
-            self.sync(**gap_filters)
-        return len(gaps) > 0
+        if not gaps:
+            return False
+
+        gap_filter_sets = [
+            {**filters, 'date_gte': gap_start, 'date_lte': gap_end}
+            for gap_start, gap_end in gaps
+        ]
+        self._sync_parallel(gap_filter_sets)
+        return True
 
     def query(self, columns: list[str] | str | None = None, **filters) -> pd.DataFrame:
         """
@@ -216,28 +373,23 @@ class CachedTable:
                     break
 
             if has_gaps:
-                # Estimate rows for full rectangle
-                n_tickers = len(ticker_filter)
-                if date_gte and date_lte:
-                    start = datetime.strptime(date_gte, '%Y-%m-%d')
-                    end = datetime.strptime(date_lte, '%Y-%m-%d')
-                    calendar_days = (end - start).days + 1
-                    # Approximate trading days (252 per year)
-                    est_trading_days = max(1, int(calendar_days * 252 / 365))
-                else:
-                    est_trading_days = 1
+                est_rows = self._estimate_rows(filters)
 
-                est_rows = n_tickers * est_trading_days
-
-                if est_rows < 10000:
-                    # Single overfetch call for entire rectangle
+                if est_rows < NDL_SPLIT_THRESHOLD:
+                    # Single overfetch call for entire rectangle (may split if needed)
                     self.sync(**filters)
                 else:
-                    # Too many rows - fall back to per-ticker gap filling
+                    # Large rectangle - collect only missing gaps to minimize data transfer
+                    all_gap_filters = []
                     for ticker in ticker_filter:
                         ticker_data = immutable[immutable['ticker'] == ticker] if len(immutable) > 0 else pd.DataFrame()
                         ticker_filters = {**filters, 'ticker': ticker}
-                        self._fill_date_gaps(ticker_data, ticker_filters)
+                        gaps = self._compute_date_gaps(ticker_data, date_gte, date_lte)
+                        for gap_start, gap_end in gaps:
+                            all_gap_filters.append({**ticker_filters, 'date_gte': gap_start, 'date_lte': gap_end})
+
+                    if all_gap_filters:
+                        self._sync_parallel(all_gap_filters)
 
                 immutable = self.get_cached(**filters)
         elif len(immutable) == 0:
