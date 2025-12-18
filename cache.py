@@ -451,29 +451,3 @@ class CachedTable:
         return result.sort_values(self.index_columns).reset_index(drop=True)
 
 
-class SEPTable(CachedTable):
-    table_name = 'SHARADAR/SEP'
-    index_columns = ['ticker', 'date']  # Put the `ticker` column first, for efficient ticker + date range queries.
-    query_columns = ['open', 'low', 'high', 'close', 'volume', 'closeadj', 'closeunadj']
-    immutable_columns = ['split_factor', 'split_dividend_factor',
-                         'openunadj', 'lowunadj', 'highunadj', 'closeunadj', 'volumeunadj']
-
-    @staticmethod
-    def immutable_data(queried: pd.DataFrame) -> pd.DataFrame:
-        immutable = pd.DataFrame()
-        immutable['split_factor'] = queried['closeunadj'] / queried['close']
-        immutable['split_dividend_factor'] = queried['closeunadj'] / queried['closeadj']
-        for column in ['open', 'low', 'high', 'close']:
-            immutable[f'{column}unadj'] = queried[column] * immutable['split_factor']
-        immutable['volumeunadj'] = queried['volume'] / immutable['split_factor']
-        return immutable
-
-    @staticmethod
-    def derived_data(immutable: pd.DataFrame) -> pd.DataFrame:
-        derived = pd.DataFrame()
-        for column in ['open', 'low', 'high', 'close']:
-            derived[column] = immutable[f'{column}unadj'] / immutable['split_factor']
-            derived[f'{column}adj'] = immutable[f'{column}unadj'] / immutable['split_dividend_factor']
-        derived['volume'] = immutable['volumeunadj'] * immutable['split_factor']
-        derived['volumeadj'] = immutable['volumeunadj'] * immutable['split_dividend_factor']
-        return derived

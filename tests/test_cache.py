@@ -8,7 +8,8 @@ from unittest.mock import patch
 from urllib.parse import parse_qs
 
 import cache
-from cache import CachedTable, SEPTable
+from cache import CachedTable
+from tables import SEPTable
 
 
 # Query fixture cache for mocking NDL API
