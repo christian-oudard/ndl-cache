@@ -37,24 +37,34 @@ class CachedTable:
     index_columns: list[str]
     query_columns: list[str]
     immutable_columns: list[str]
+    date_column: str = 'date'  # Column used for date-based filtering and sync bounds
+    column_types: dict[str, str] = {}  # Override column types (defaults: ticker=VARCHAR, date-like=DATE, rest=DOUBLE)
+    rows_per_year: int = TRADING_DAYS_PER_YEAR  # Expected rows per ticker per year (for request size estimation)
 
     def __init__(self, db_path: str = 'cache.duckdb'):
         self.db_path = Path(db_path)
         self.conn = duckdb.connect(str(self.db_path))
         self._ensure_table()
 
+    def _get_column_type(self, col: str) -> str:
+        """Determine SQL type for a column."""
+        # Check explicit override first
+        if col in self.column_types:
+            return self.column_types[col]
+        # Defaults based on naming
+        if col == 'ticker':
+            return 'VARCHAR'
+        if col == 'date' or col.endswith('date') or col in ('datekey', 'reportperiod', 'lastupdated'):
+            return 'DATE'
+        if col == 'dimension':
+            return 'VARCHAR'
+        return 'DOUBLE'
+
     def _ensure_table(self):
         """Create data table and sync_bounds table if they don't exist."""
         # Data table
         cols = self.index_columns + self.immutable_columns
-        col_defs = []
-        for col in cols:
-            if col == 'date':
-                col_defs.append(f'{col} DATE')
-            elif col == 'ticker':
-                col_defs.append(f'{col} VARCHAR')
-            else:
-                col_defs.append(f'{col} DOUBLE')
+        col_defs = [f'{col} {self._get_column_type(col)}' for col in cols]
 
         pk = ', '.join(self.index_columns)
         self.conn.execute(f"""
@@ -138,63 +148,61 @@ class CachedTable:
         """Derive output columns from immutable data. Override in subclass."""
         raise NotImplementedError
 
-    @staticmethod
-    def _estimate_trading_days(date_gte: str | None, date_lte: str | None) -> int:
-        """Estimate number of trading days in a date range."""
+    def _estimate_rows_for_range(self, date_gte: str | None, date_lte: str | None) -> int:
+        """Estimate number of rows per ticker for a date range."""
         if not (date_gte and date_lte):
             return 1
         start = datetime.strptime(date_gte, '%Y-%m-%d')
         end = datetime.strptime(date_lte, '%Y-%m-%d')
         calendar_days = (end - start).days + 1
-        return max(1, int(calendar_days * TRADING_DAYS_PER_YEAR / 365))
+        return max(1, int(calendar_days * self.rows_per_year / 365))
 
-    @staticmethod
-    def _estimate_rows(filters: dict) -> int:
+    def _estimate_rows(self, filters: dict) -> int:
         """Estimate number of rows a filter set will return."""
         ticker = filters.get('ticker')
         n_tickers = len(ticker) if isinstance(ticker, list) else 1
-        est_days = CachedTable._estimate_trading_days(
-            filters.get('date_gte'),
-            filters.get('date_lte')
+        date_col = self.date_column
+        est_rows_per_ticker = self._estimate_rows_for_range(
+            filters.get(f'{date_col}_gte'),
+            filters.get(f'{date_col}_lte')
         )
-        return n_tickers * est_days
+        return n_tickers * est_rows_per_ticker
 
-    @staticmethod
-    def _split_filters(filters: dict, max_rows: int = NDL_SPLIT_THRESHOLD) -> list[dict]:
+    def _split_filters(self, filters: dict, max_rows: int = NDL_SPLIT_THRESHOLD) -> list[dict]:
         """
         Split a filter set into chunks that each return < max_rows.
         Splits by tickers first, then by date ranges if needed.
         """
-        est_rows = CachedTable._estimate_rows(filters)
+        est_rows = self._estimate_rows(filters)
         if est_rows < max_rows:
             return [filters]
 
+        date_col = self.date_column
         ticker = filters.get('ticker')
-        date_gte = filters.get('date_gte')
-        date_lte = filters.get('date_lte')
+        date_gte = filters.get(f'{date_col}_gte')
+        date_lte = filters.get(f'{date_col}_lte')
 
         # Strategy 1: Split by tickers
         if isinstance(ticker, list) and len(ticker) > 1:
-            est_days = CachedTable._estimate_trading_days(date_gte, date_lte)
-            tickers_per_chunk = max(1, max_rows // est_days)
+            est_rows_per_ticker = self._estimate_rows_for_range(date_gte, date_lte)
+            tickers_per_chunk = max(1, max_rows // est_rows_per_ticker)
 
             chunks = []
             for i in range(0, len(ticker), tickers_per_chunk):
                 chunk_tickers = ticker[i:i + tickers_per_chunk]
                 chunk_filters = {**filters, 'ticker': chunk_tickers if len(chunk_tickers) > 1 else chunk_tickers[0]}
                 # Recursively split if still too large (e.g., very long date range)
-                chunks.extend(CachedTable._split_filters(chunk_filters, max_rows))
+                chunks.extend(self._split_filters(chunk_filters, max_rows))
             return chunks
 
         # Strategy 2: Split by date range (for single ticker with long history)
         if date_gte and date_lte:
             start = datetime.strptime(date_gte, '%Y-%m-%d')
             end = datetime.strptime(date_lte, '%Y-%m-%d')
-            total_days = (end - start).days + 1
 
             # Calculate days per chunk to stay under max_rows
-            # For single ticker: rows ≈ trading_days ≈ calendar_days * 252/365
-            calendar_days_per_chunk = max(1, int(max_rows * 365 / TRADING_DAYS_PER_YEAR))
+            # calendar_days_per_chunk = max_rows * 365 / rows_per_year
+            calendar_days_per_chunk = max(1, int(max_rows * 365 / self.rows_per_year))
 
             chunks = []
             chunk_start = start
@@ -202,8 +210,8 @@ class CachedTable:
                 chunk_end = min(chunk_start + timedelta(days=calendar_days_per_chunk - 1), end)
                 chunk_filters = {
                     **filters,
-                    'date_gte': chunk_start.strftime('%Y-%m-%d'),
-                    'date_lte': chunk_end.strftime('%Y-%m-%d'),
+                    f'{date_col}_gte': chunk_start.strftime('%Y-%m-%d'),
+                    f'{date_col}_lte': chunk_end.strftime('%Y-%m-%d'),
                 }
                 chunks.append(chunk_filters)
                 chunk_start = chunk_end + timedelta(days=1)
@@ -231,12 +239,13 @@ class CachedTable:
 
         requests = solve_cover(gaps, max_rows)
 
-        # Convert Request objects to filter dicts
+        # Convert Request objects to filter dicts using table's date column
+        date_col = self.date_column
         return [
             {
                 'ticker': list(req.tickers) if len(req.tickers) > 1 else list(req.tickers)[0],
-                'date_gte': req.start,
-                'date_lte': req.end,
+                f'{date_col}_gte': req.start,
+                f'{date_col}_lte': req.end,
             }
             for req in requests
         ]
@@ -334,10 +343,11 @@ class CachedTable:
 
         # Update sync bounds for all tickers in the filter sets
         # (even if we got no data - we still queried that range)
+        date_col = self.date_column
         for filters in filter_sets:
             ticker = filters.get('ticker')
-            date_gte = filters.get('date_gte')
-            date_lte = filters.get('date_lte')
+            date_gte = filters.get(f'{date_col}_gte')
+            date_lte = filters.get(f'{date_col}_lte')
             if ticker and date_gte and date_lte:
                 tickers = ticker if isinstance(ticker, list) else [ticker]
                 for t in tickers:
@@ -409,8 +419,9 @@ class CachedTable:
         else:
             tickers = []
 
-        date_gte = filters.get('date_gte')
-        date_lte = filters.get('date_lte')
+        # Get date filters using the table's date column
+        date_gte = filters.get(f'{self.date_column}_gte')
+        date_lte = filters.get(f'{self.date_column}_lte')
 
         # Use cover solver to compute optimal fetches for gaps
         if tickers and date_gte and date_lte:
