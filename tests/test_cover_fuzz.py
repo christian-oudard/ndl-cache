@@ -1,7 +1,7 @@
 """
 Fuzz test for the set-cover solver.
 
-Generates random cache states and validates the solver produces correct results.
+Generates random sync bounds and validates the solver produces correct results.
 """
 import random
 import pytest
@@ -21,45 +21,30 @@ def random_date_range(start: str = '2024-01-01', end: str = '2024-12-31') -> tup
     return d1.strftime('%Y-%m-%d'), d2.strftime('%Y-%m-%d')
 
 
-def generate_cached_cells(
+def generate_sync_bounds(
     tickers: list[str],
-    date_start: str,
-    date_end: str,
-    coverage_prob: float = 0.3,
-) -> set[tuple[str, str]]:
-    """Generate random cached cells with given coverage probability."""
-    cached = set()
-    s = datetime.strptime(date_start, '%Y-%m-%d')
-    e = datetime.strptime(date_end, '%Y-%m-%d')
-
-    current = s
-    while current <= e:
-        date_str = current.strftime('%Y-%m-%d')
-        for ticker in tickers:
-            if random.random() < coverage_prob:
-                cached.add((ticker, date_str))
-        current += timedelta(days=1)
-
-    return cached
+    query_start: str,
+    query_end: str,
+    sync_prob: float = 0.5,
+) -> dict[str, tuple[str, str] | None]:
+    """Generate random sync bounds for tickers."""
+    bounds = {}
+    for ticker in tickers:
+        if random.random() < sync_prob:
+            # Generate bounds that may or may not overlap with query
+            synced_from, synced_to = random_date_range(query_start, query_end)
+            bounds[ticker] = (synced_from, synced_to)
+        else:
+            bounds[ticker] = None
+    return bounds
 
 
 def validate_solution(gaps: list[Gap], requests: list[Request], max_rows: int) -> None:
     """Validate that the solution is correct."""
-    # All requests must be under max_rows
-    for r in requests:
-        assert r.rows() <= max_rows, f"Request {r} exceeds max_rows ({r.rows()} > {max_rows})"
-
-    # All gap cells must be covered
-    needed = set()
-    for g in gaps:
-        needed.update(g.cells())
-
-    covered = set()
-    for r in requests:
-        covered.update(r.cells())
-
-    missing = needed - covered
-    assert not missing, f"Missing cells: {list(missing)[:10]}..."
+    # All gaps must be covered
+    for gap in gaps:
+        covered = any(r.covers(gap) for r in requests)
+        assert covered, f"Gap {gap} not covered by any request"
 
 
 @pytest.mark.parametrize("seed", range(20))
@@ -70,12 +55,12 @@ def test_cover_fuzz(seed):
     # Vary parameters based on seed for diversity
     num_tickers = random.randint(1, 15)
     tickers = [f'T{i}' for i in range(num_tickers)]
-    date_start, date_end = random_date_range('2024-01-01', '2024-03-31')
-    coverage_prob = random.uniform(0.1, 0.9)
+    query_start, query_end = random_date_range('2024-01-01', '2024-03-31')
+    sync_prob = random.uniform(0.0, 1.0)
     max_rows = random.choice([5, 10, 20, 50])
 
-    cached = generate_cached_cells(tickers, date_start, date_end, coverage_prob)
-    gaps = find_gaps(tickers, date_start, date_end, cached)
+    sync_bounds = generate_sync_bounds(tickers, query_start, query_end, sync_prob)
+    gaps = find_gaps(tickers, query_start, query_end, sync_bounds)
 
     if not gaps:
         return  # Nothing to test

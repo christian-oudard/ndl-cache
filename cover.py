@@ -1,14 +1,11 @@
 """
 Set-cover solver for minimizing API requests.
 
-Given a set of gaps (ticker, date_start, date_end) that need to be fetched,
-find the minimum number of requests that cover all gaps while staying under
-the row limit per request.
+Given sync bounds per ticker, find gaps (before/after synced ranges) and
+batch them into minimal requests while staying under the row limit.
 
-Key constraint: We can select arbitrary sets of tickers, but only
-contiguous date ranges (API uses date.gte/date.lte).
-
-This is a set-cover variant solved with greedy heuristics.
+Key insight: Gaps only occur at boundaries (before synced_from or after synced_to),
+so we can exploit this structure for efficient batching.
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -20,23 +17,13 @@ class Gap:
     ticker: str
     start: str  # YYYY-MM-DD
     end: str    # YYYY-MM-DD
+    is_past_gap: bool  # True if gap is before synced_from, False if after synced_to
 
     def days(self) -> int:
         """Number of calendar days in this gap."""
         s = datetime.strptime(self.start, '%Y-%m-%d')
         e = datetime.strptime(self.end, '%Y-%m-%d')
         return (e - s).days + 1
-
-    def cells(self) -> set[tuple[str, str]]:
-        """Return set of (ticker, date) cells this gap covers."""
-        result = set()
-        s = datetime.strptime(self.start, '%Y-%m-%d')
-        e = datetime.strptime(self.end, '%Y-%m-%d')
-        current = s
-        while current <= e:
-            result.add((self.ticker, current.strftime('%Y-%m-%d')))
-            current += timedelta(days=1)
-        return result
 
 
 @dataclass(frozen=True)
@@ -46,12 +33,15 @@ class Request:
     start: str
     end: str
 
-    def rows(self, rows_per_ticker_day: int = 1) -> int:
-        """Estimated rows this request will return."""
+    def days(self) -> int:
+        """Number of calendar days in this request."""
         s = datetime.strptime(self.start, '%Y-%m-%d')
         e = datetime.strptime(self.end, '%Y-%m-%d')
-        days = (e - s).days + 1
-        return len(self.tickers) * days * rows_per_ticker_day
+        return (e - s).days + 1
+
+    def rows(self, rows_per_ticker_day: int = 1) -> int:
+        """Estimated rows this request will return."""
+        return len(self.tickers) * self.days() * rows_per_ticker_day
 
     def covers(self, gap: Gap) -> bool:
         """Does this request fully cover the given gap?"""
@@ -61,61 +51,61 @@ class Request:
             and gap.end <= self.end
         )
 
-    def cells(self) -> set[tuple[str, str]]:
-        """Return set of (ticker, date) cells this request covers."""
-        result = set()
-        s = datetime.strptime(self.start, '%Y-%m-%d')
-        e = datetime.strptime(self.end, '%Y-%m-%d')
-        current = s
-        while current <= e:
-            date_str = current.strftime('%Y-%m-%d')
-            for ticker in self.tickers:
-                result.add((ticker, date_str))
-            current += timedelta(days=1)
-        return result
+
+def _day_before(date_str: str) -> str:
+    """Return the day before the given date."""
+    d = datetime.strptime(date_str, '%Y-%m-%d')
+    return (d - timedelta(days=1)).strftime('%Y-%m-%d')
+
+
+def _day_after(date_str: str) -> str:
+    """Return the day after the given date."""
+    d = datetime.strptime(date_str, '%Y-%m-%d')
+    return (d + timedelta(days=1)).strftime('%Y-%m-%d')
 
 
 def find_gaps(
     tickers: list[str],
-    start: str,
-    end: str,
-    cached: set[tuple[str, str]],
+    query_start: str,
+    query_end: str,
+    sync_bounds: dict[str, tuple[str, str] | None],
 ) -> list[Gap]:
     """
-    Find gaps between a query and cached cells.
+    Find gaps between a query and synced bounds.
 
     Args:
         tickers: Tickers being queried
-        start: Query start date (YYYY-MM-DD)
-        end: Query end date (YYYY-MM-DD)
-        cached: Set of (ticker, date) cells already cached
+        query_start: Query start date (YYYY-MM-DD)
+        query_end: Query end date (YYYY-MM-DD)
+        sync_bounds: Dict mapping ticker -> (synced_from, synced_to) or None if not synced
 
     Returns:
-        List of gaps (contiguous date ranges per ticker) not in cache
+        List of gaps (at most 2 per ticker: before and/or after synced range)
     """
     gaps = []
-    s = datetime.strptime(start, '%Y-%m-%d')
-    e = datetime.strptime(end, '%Y-%m-%d')
 
     for ticker in tickers:
-        current = s
-        gap_start = None
+        bounds = sync_bounds.get(ticker)
 
-        while current <= e:
-            date_str = current.strftime('%Y-%m-%d')
-            is_missing = (ticker, date_str) not in cached
+        if bounds is None:
+            # Never synced - entire query range is a gap
+            # Mark as past_gap (arbitrary, but consistent)
+            gaps.append(Gap(ticker, query_start, query_end, is_past_gap=True))
+            continue
 
-            if is_missing and gap_start is None:
-                gap_start = date_str
-            elif not is_missing and gap_start is not None:
-                prev_date = (current - timedelta(days=1)).strftime('%Y-%m-%d')
-                gaps.append(Gap(ticker, gap_start, prev_date))
-                gap_start = None
+        synced_from, synced_to = bounds
 
-            current += timedelta(days=1)
+        # Gap before synced range
+        if query_start < synced_from:
+            gap_end = _day_before(synced_from)
+            if gap_end >= query_start:  # Valid gap
+                gaps.append(Gap(ticker, query_start, gap_end, is_past_gap=True))
 
-        if gap_start is not None:
-            gaps.append(Gap(ticker, gap_start, end))
+        # Gap after synced range
+        if query_end > synced_to:
+            gap_start = _day_after(synced_to)
+            if gap_start <= query_end:  # Valid gap
+                gaps.append(Gap(ticker, gap_start, query_end, is_past_gap=False))
 
     return gaps
 
@@ -128,8 +118,7 @@ def solve_cover(
     """
     Find a set of requests that cover all gaps, minimizing request count.
 
-    Uses a greedy heuristic: repeatedly pick the request that covers
-    the most uncovered cells while staying under max_rows.
+    Uses boundary-aware batching: past gaps share query_start, future gaps share query_end.
 
     Args:
         gaps: List of gaps to cover
@@ -142,94 +131,90 @@ def solve_cover(
     if not gaps:
         return []
 
-    # Convert gaps to cells that need coverage
-    remaining: set[tuple[str, str]] = set()
-    for gap in gaps:
-        remaining.update(gap.cells())
+    past_gaps = [g for g in gaps if g.is_past_gap]
+    future_gaps = [g for g in gaps if not g.is_past_gap]
 
     requests = []
-
-    while remaining:
-        best_request = _find_best_request(remaining, max_rows, rows_per_ticker_day)
-        requests.append(best_request)
-        remaining -= best_request.cells()
+    requests.extend(_batch_gaps(past_gaps, max_rows, rows_per_ticker_day, is_past=True))
+    requests.extend(_batch_gaps(future_gaps, max_rows, rows_per_ticker_day, is_past=False))
 
     return requests
 
 
-def _find_best_request(
-    cells: set[tuple[str, str]],
+def _batch_gaps(
+    gaps: list[Gap],
     max_rows: int,
     rows_per_ticker_day: int,
-) -> Request:
+    is_past: bool,
+) -> list[Request]:
     """
-    Find the request that covers the most cells while staying under max_rows.
+    Batch gaps into requests, exploiting boundary structure.
 
-    Strategy: Group cells by date, try different date ranges and ticker combinations.
+    For past gaps: all share the same start date, sort by end date descending (longest first)
+    For future gaps: all share the same end date, sort by start date ascending (longest first)
+
+    Greedy algorithm: pack tickers into requests while staying under max_rows.
     """
-    # Group cells by date and by ticker
-    by_date: dict[str, set[str]] = {}  # date -> set of tickers
-    by_ticker: dict[str, set[str]] = {}  # ticker -> set of dates
-    all_tickers: set[str] = set()
-    all_dates: set[str] = set()
+    if not gaps:
+        return []
 
-    for ticker, date in cells:
-        by_date.setdefault(date, set()).add(ticker)
-        by_ticker.setdefault(ticker, set()).add(date)
-        all_tickers.add(ticker)
-        all_dates.add(date)
+    requests = []
 
-    sorted_dates = sorted(all_dates)
-    max_days = max_rows // rows_per_ticker_day
+    if is_past:
+        # Past gaps: share start, vary by end. Sort by end descending (longest first).
+        sorted_gaps = sorted(gaps, key=lambda g: g.end, reverse=True)
+    else:
+        # Future gaps: share end, vary by start. Sort by start ascending (longest first).
+        sorted_gaps = sorted(gaps, key=lambda g: g.start)
 
-    best_request = None
-    best_coverage = 0
+    # Group gaps by their boundary date for efficient batching
+    # Past gaps: group by end date, future gaps: group by start date
+    remaining = list(sorted_gaps)
 
-    # Strategy: Try different date ranges
-    for i, start_date in enumerate(sorted_dates):
-        # Try expanding the date range
-        for j in range(i, len(sorted_dates)):
-            end_date = sorted_dates[j]
+    while remaining:
+        # Start a new request with the first (longest) gap
+        first = remaining.pop(0)
+        batch_tickers = [first.ticker]
 
-            s = datetime.strptime(start_date, '%Y-%m-%d')
-            e = datetime.strptime(end_date, '%Y-%m-%d')
-            days = (e - s).days + 1
+        if is_past:
+            # Request range: (shared start, this gap's end)
+            req_start = first.start
+            req_end = first.end
+        else:
+            # Request range: (this gap's start, shared end)
+            req_start = first.start
+            req_end = first.end
 
-            max_tickers_for_range = max_rows // (days * rows_per_ticker_day)
-            if max_tickers_for_range < 1:
-                break  # Can't fit even one ticker, no point extending further
+        req_days = (datetime.strptime(req_end, '%Y-%m-%d') -
+                    datetime.strptime(req_start, '%Y-%m-%d')).days + 1
+        current_rows = req_days * rows_per_ticker_day
 
-            # Find tickers that have cells in this date range
-            tickers_with_cells = set()
-            for d_idx in range(i, j + 1):
-                d = sorted_dates[d_idx]
-                tickers_with_cells.update(by_date.get(d, set()))
+        # Try to add more tickers that fit within the same date range
+        still_remaining = []
+        for gap in remaining:
+            gap_days = gap.days()
+            additional_rows = req_days * rows_per_ticker_day  # Each ticker adds req_days worth
 
-            # Take up to max_tickers (prioritize tickers with more cells in range)
-            ticker_cell_counts = []
-            for t in tickers_with_cells:
-                count = sum(1 for d_idx in range(i, j + 1)
-                           if sorted_dates[d_idx] in by_ticker.get(t, set()))
-                ticker_cell_counts.append((count, t))
-            ticker_cell_counts.sort(reverse=True)
+            if current_rows + additional_rows <= max_rows:
+                # Check if this gap fits within the request range
+                if is_past:
+                    # Past gap: must have end <= req_end (will be covered by overfetch)
+                    if gap.end <= req_end:
+                        batch_tickers.append(gap.ticker)
+                        current_rows += additional_rows
+                    else:
+                        still_remaining.append(gap)
+                else:
+                    # Future gap: must have start >= req_start (will be covered by overfetch)
+                    if gap.start >= req_start:
+                        batch_tickers.append(gap.ticker)
+                        current_rows += additional_rows
+                    else:
+                        still_remaining.append(gap)
+            else:
+                still_remaining.append(gap)
 
-            selected_tickers = frozenset(
-                t for _, t in ticker_cell_counts[:max_tickers_for_range]
-            )
+        remaining = still_remaining
+        requests.append(Request(frozenset(batch_tickers), req_start, req_end))
 
-            if not selected_tickers:
-                continue
-
-            request = Request(selected_tickers, start_date, end_date)
-            coverage = len(request.cells() & cells)
-
-            if coverage > best_coverage:
-                best_coverage = coverage
-                best_request = request
-
-    # Fallback: single cell
-    if best_request is None:
-        ticker, date = next(iter(cells))
-        best_request = Request(frozenset([ticker]), date, date)
-
-    return best_request
+    return requests

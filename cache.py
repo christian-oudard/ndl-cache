@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import duckdb
 import warnings
-from cover import Gap, Request, solve_cover, find_gaps
+from cover import solve_cover, find_gaps
 
 # Optimal parallelization level based on benchmarking ~10k row requests
 # Higher values hit server-side throttling with diminishing returns
@@ -21,6 +21,15 @@ NDL_SPLIT_THRESHOLD = 9000
 # Approximate trading days per calendar year
 TRADING_DAYS_PER_YEAR = 252
 
+# Sharadar data delay - don't mark recent dates as synced since data may still appear
+SHARADAR_DELAY_DAYS = 3
+
+
+def _effective_sync_date(date_str: str) -> str:
+    """Cap a date to account for Sharadar's data delay."""
+    max_sync_date = (datetime.now() - timedelta(days=SHARADAR_DELAY_DAYS)).strftime('%Y-%m-%d')
+    return min(date_str, max_sync_date)
+
 
 class CachedTable:
     """Base class for cached NDL tables."""
@@ -35,7 +44,8 @@ class CachedTable:
         self._ensure_table()
 
     def _ensure_table(self):
-        """Create table if it doesn't exist."""
+        """Create data table and sync_bounds table if they don't exist."""
+        # Data table
         cols = self.index_columns + self.immutable_columns
         col_defs = []
         for col in cols:
@@ -54,8 +64,69 @@ class CachedTable:
             )
         """)
 
+        # Sync bounds table
+        self.conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self._sync_bounds_table_name()} (
+                ticker VARCHAR PRIMARY KEY,
+                synced_from DATE,
+                synced_to DATE
+            )
+        """)
+
     def _safe_table_name(self) -> str:
         return self.table_name.replace('/', '_').lower()
+
+    def _sync_bounds_table_name(self) -> str:
+        return f"{self._safe_table_name()}_sync_bounds"
+
+    def _get_sync_bounds(self, tickers: list[str]) -> dict[str, tuple[str, str] | None]:
+        """
+        Get sync bounds for given tickers.
+        Returns dict mapping ticker -> (synced_from, synced_to) or None if not synced.
+        """
+        if not tickers:
+            return {}
+
+        placeholders = ', '.join(['?'] * len(tickers))
+        result = self.conn.execute(f"""
+            SELECT ticker, synced_from, synced_to
+            FROM {self._sync_bounds_table_name()}
+            WHERE ticker IN ({placeholders})
+        """, tickers).fetchall()
+
+        bounds = {ticker: None for ticker in tickers}
+        for ticker, synced_from, synced_to in result:
+            bounds[ticker] = (str(synced_from)[:10], str(synced_to)[:10])
+
+        return bounds
+
+    def _update_sync_bounds(self, ticker: str, from_date: str, to_date: str):
+        """
+        Update sync bounds for a ticker, expanding the existing range.
+        Caps to_date to account for Sharadar's data delay.
+        """
+        effective_to = _effective_sync_date(to_date)
+
+        # Get existing bounds
+        existing = self.conn.execute(f"""
+            SELECT synced_from, synced_to
+            FROM {self._sync_bounds_table_name()}
+            WHERE ticker = ?
+        """, [ticker]).fetchone()
+
+        if existing:
+            old_from, old_to = str(existing[0])[:10], str(existing[1])[:10]
+            new_from = min(from_date, old_from)
+            new_to = max(effective_to, old_to)
+        else:
+            new_from = from_date
+            new_to = effective_to
+
+        self.conn.execute(f"""
+            INSERT OR REPLACE INTO {self._sync_bounds_table_name()}
+            (ticker, synced_from, synced_to)
+            VALUES (?, ?, ?)
+        """, [ticker, new_from, new_to])
 
     @staticmethod
     def immutable_data(queried: pd.DataFrame) -> pd.DataFrame:
@@ -141,17 +212,6 @@ class CachedTable:
         # Can't split further
         return [filters]
 
-    def _get_cached_cells(self, tickers: list[str], date_gte: str, date_lte: str) -> set[tuple[str, str]]:
-        """Get set of (ticker, date) cells currently in cache for given query."""
-        if not tickers or not date_gte or not date_lte:
-            return set()
-
-        cached = self.get_cached(ticker=tickers, date_gte=date_gte, date_lte=date_lte)
-        if len(cached) == 0:
-            return set()
-
-        return {(row['ticker'], str(row['date'])[:10]) for _, row in cached.iterrows()}
-
     def _compute_optimal_fetches(
         self,
         tickers: list[str],
@@ -163,8 +223,8 @@ class CachedTable:
         Compute optimal fetch filter sets using set-cover solver.
         Returns list of filter dicts that cover all gaps with minimal requests.
         """
-        cached_cells = self._get_cached_cells(tickers, date_gte, date_lte)
-        gaps = find_gaps(tickers, date_gte, date_lte, cached_cells)
+        sync_bounds = self._get_sync_bounds(tickers)
+        gaps = find_gaps(tickers, date_gte, date_lte, sync_bounds)
 
         if not gaps:
             return []
@@ -264,9 +324,25 @@ class CachedTable:
     def _sync_parallel(self, filter_sets: list[dict]) -> int:
         """
         Fetch multiple filter sets in parallel and sync to cache.
+        Also updates sync bounds for each ticker in each filter set.
         Returns total rows synced.
         """
+        if not filter_sets:
+            return 0
+
         queried = self._fetch_parallel(filter_sets)
+
+        # Update sync bounds for all tickers in the filter sets
+        # (even if we got no data - we still queried that range)
+        for filters in filter_sets:
+            ticker = filters.get('ticker')
+            date_gte = filters.get('date_gte')
+            date_lte = filters.get('date_lte')
+            if ticker and date_gte and date_lte:
+                tickers = ticker if isinstance(ticker, list) else [ticker]
+                for t in tickers:
+                    self._update_sync_bounds(t, date_gte, date_lte)
+
         if len(queried) == 0:
             return 0
 
@@ -318,77 +394,6 @@ class CachedTable:
             SELECT * FROM {self._safe_table_name()}
             WHERE {where}
         """, params).df()
-
-    def _compute_date_gaps(self, cached_data: pd.DataFrame, date_gte: str, date_lte: str) -> list[tuple[str, str]]:
-        """
-        Compute date range gaps in cached data.
-        Returns list of (gap_start, gap_end) tuples.
-        """
-        if not (date_gte and date_lte):
-            return []
-
-        if 'date' not in cached_data.columns or len(cached_data) == 0:
-            return [(date_gte, date_lte)]
-
-        cached_dates = set(str(d)[:10] for d in cached_data['date'])
-        if not cached_dates:
-            return [(date_gte, date_lte)]
-
-        cached_min = min(cached_dates)
-        cached_max = max(cached_dates)
-        gaps = []
-
-        # Gap before cached range
-        if date_gte < cached_min:
-            day_before_min = (datetime.strptime(cached_min, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
-            gaps.append((date_gte, day_before_min))
-
-        # Gap after cached range
-        if date_lte > cached_max:
-            day_after_max = (datetime.strptime(cached_max, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-            gaps.append((day_after_max, date_lte))
-
-        # Gaps within cached range
-        if cached_min <= date_gte and date_lte <= cached_max:
-            start = datetime.strptime(date_gte, '%Y-%m-%d')
-            end = datetime.strptime(date_lte, '%Y-%m-%d')
-            gap_start = None
-            current = start
-            while current <= end:
-                date_str = current.strftime('%Y-%m-%d')
-                if date_str not in cached_dates:
-                    if gap_start is None:
-                        gap_start = date_str
-                    gap_end = date_str
-                else:
-                    if gap_start is not None:
-                        gaps.append((gap_start, gap_end))
-                        gap_start = None
-                current += timedelta(days=1)
-            if gap_start is not None:
-                gaps.append((gap_start, gap_end))
-
-        return gaps
-
-    def _fill_date_gaps(self, cached_data: pd.DataFrame, filters: dict) -> bool:
-        """
-        Check for date range gaps in cached data and fetch missing dates.
-        Returns True if any data was fetched.
-        """
-        gaps = self._compute_date_gaps(
-            cached_data,
-            filters.get('date_gte'),
-            filters.get('date_lte')
-        )
-        if not gaps:
-            return False
-
-        gap_filter_sets = [
-            {**filters, 'date_gte': gap_start, 'date_lte': gap_end}
-            for gap_start, gap_end in gaps
-        ]
-        self._sync_parallel(gap_filter_sets)
-        return True
 
     def query(self, columns: list[str] | str | None = None, **filters) -> pd.DataFrame:
         """

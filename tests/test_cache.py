@@ -465,12 +465,47 @@ class TestSetIntersection:
         assert date_filter.get('gte') == '2020-09-01', \
             f"Second API call should start from Tuesday, got {date_filter}"
 
-    def test_date_range_gap_fill(self, sep, track_api_calls):
+    def test_date_range_boundary_extension(self, sep, track_api_calls):
         """
-        Query Monday, then Wednesday, then Monday-Wednesday.
-        The third query should only fetch Tuesday (the gap).
+        Bounds-based sync tracking: query Mon-Wed, then extend to Mon-Fri.
+        Extension query should only fetch Thu-Fri (boundary gap).
         """
-        # First query: Monday (2020-08-31)
+        # First query: Monday-Wednesday (2020-08-31 to 2020-09-02)
+        df1 = sep.query(
+            columns=['close'],
+            ticker='AAPL',
+            date_gte='2020-08-31',
+            date_lte='2020-09-02'
+        )
+        assert len(df1) == 3
+        assert len(track_api_calls) == 1
+
+        # Second query: Monday-Friday (extend end date)
+        df2 = sep.query(
+            columns=['close'],
+            ticker='AAPL',
+            date_gte='2020-08-31',
+            date_lte='2020-09-04'
+        )
+        assert len(df2) == 5
+
+        # Should have made ONE additional call for Thu-Fri only
+        assert len(track_api_calls) == 2, f"Expected 2 total API calls, got {len(track_api_calls)}"
+
+        # Verify second call was for the extension (Thu-Fri)
+        second_call = track_api_calls[1]
+        date_filter = second_call['kwargs'].get('date', {})
+        assert date_filter.get('gte') == '2020-09-03', \
+            f"Second API call should start from Thursday, got {date_filter}"
+        assert date_filter.get('lte') == '2020-09-04', \
+            f"Second API call should end on Friday, got {date_filter}"
+
+    def test_disjoint_queries_fill_gap(self, sep, track_api_calls):
+        """
+        Query Monday, then Friday separately.
+        The Friday query should fetch Tue-Fri to extend the synced range.
+        """
+        # First query: Monday only (2020-08-31)
         df1 = sep.query(
             columns=['close'],
             ticker='AAPL',
@@ -480,40 +515,43 @@ class TestSetIntersection:
         assert len(df1) == 1
         assert len(track_api_calls) == 1
 
-        # Second query: Wednesday (2020-09-02)
+        # Second query: Friday only (2020-09-04)
+        # This should trigger a fetch for Tue-Fri (the gap after synced_to)
         df2 = sep.query(
             columns=['close'],
             ticker='AAPL',
-            date_gte='2020-09-02',
-            date_lte='2020-09-02'
+            date_gte='2020-09-04',
+            date_lte='2020-09-04'
         )
         assert len(df2) == 1
-        assert len(track_api_calls) == 2
+        assert len(track_api_calls) == 2, f"Expected 2 API calls, got {len(track_api_calls)}"
 
-        # Third query: Monday through Wednesday
+        # Verify second call fetched Tue-Fri (extends from day after Mon to Fri)
+        second_call = track_api_calls[1]
+        date_filter = second_call['kwargs'].get('date', {})
+        assert date_filter.get('gte') == '2020-09-01', \
+            f"Second call should start from Tuesday (day after synced_to), got {date_filter}"
+        assert date_filter.get('lte') == '2020-09-04', \
+            f"Second call should end on Friday, got {date_filter}"
+
+        # Now the full range Mon-Fri should be cached
         df3 = sep.query(
             columns=['close'],
             ticker='AAPL',
             date_gte='2020-08-31',
-            date_lte='2020-09-02'
+            date_lte='2020-09-04'
         )
-        assert len(df3) == 3
-
-        # Should have made exactly ONE more call for Tuesday only
-        assert len(track_api_calls) == 3, f"Expected 3 total API calls, got {len(track_api_calls)}"
-
-        # Verify third call was only for Tuesday
-        third_call = track_api_calls[2]
-        date_filter = third_call['kwargs'].get('date', {})
-        assert date_filter.get('gte') == '2020-09-01', \
-            f"Third API call should start from Tuesday, got {date_filter}"
-        assert date_filter.get('lte') == '2020-09-01', \
-            f"Third API call should end on Tuesday, got {date_filter}"
+        assert len(df3) == 5, f"Should have all 5 days cached, got {len(df3)}"
+        # No additional API calls needed
+        assert len(track_api_calls) == 2, \
+            f"Third query should use cache, expected 2 total calls, got {len(track_api_calls)}"
 
     def test_multi_ticker_different_gaps(self, sep, track_api_calls):
         """
         Query MSFT Mon-Wed, then AAPL Wed-Fri, then both Mon-Fri.
-        With overfetch strategy, third query makes ONE call for full rectangle.
+        With bounds-based tracking, third query fills boundary gaps per ticker:
+        - MSFT needs Thu-Fri (future gap)
+        - AAPL needs Mon-Tue (past gap)
         """
         # First query: MSFT Monday-Wednesday (2020-08-31 to 2020-09-02)
         df1 = sep.query(
@@ -548,15 +586,20 @@ class TestSetIntersection:
         assert len(df3) == 10, f"Expected 10 rows, got {len(df3)}"
         assert set(df3['ticker'].unique()) == {'MSFT', 'AAPL'}
 
-        # With overfetch: ONE call for full rectangle (both tickers × Mon-Fri)
-        assert len(track_api_calls) == 3, f"Expected 3 total API calls, got {len(track_api_calls)}"
+        # Bounds-based: 2 additional calls (AAPL past gap + MSFT future gap)
+        assert len(track_api_calls) == 4, f"Expected 4 total API calls, got {len(track_api_calls)}"
 
-        # Verify overfetch call covers full rectangle
-        overfetch_call = track_api_calls[2]
-        assert set(overfetch_call['kwargs'].get('ticker')) == {'MSFT', 'AAPL'}
-        date_filter = overfetch_call['kwargs'].get('date', {})
-        assert date_filter.get('gte') == '2020-08-31'
-        assert date_filter.get('lte') == '2020-09-04'
+        # Check gap-fill calls (order depends on solver, check both are present)
+        gap_calls = track_api_calls[2:]
+        gap_dates = [(c['kwargs'].get('date', {}).get('gte'), c['kwargs'].get('date', {}).get('lte'))
+                     for c in gap_calls]
+        # Should have AAPL Mon-Tue and MSFT Thu-Fri
+        assert ('2020-08-31', '2020-09-01') in gap_dates or \
+               any('2020-08-31' in str(d) for d in gap_dates), \
+               f"Expected past gap Mon-Tue, got {gap_dates}"
+        assert ('2020-09-03', '2020-09-04') in gap_dates or \
+               any('2020-09-04' in str(d) for d in gap_dates), \
+               f"Expected future gap Thu-Fri, got {gap_dates}"
 
     def test_multi_ticker_same_gap_batched(self, sep, track_api_calls):
         """
@@ -598,48 +641,51 @@ class TestSetIntersection:
 
     def test_cover_solver_batches_efficiently(self, sep, track_api_calls):
         """
-        Cover solver batches tickers efficiently, fetching only missing gaps.
+        Cover solver batches tickers with similar gaps efficiently.
 
         Cache state:
-          MSFT: has Mon, Wed (missing Tue)
-          AAPL: has Wed only (missing Mon, Tue)
+          MSFT: synced Mon-Tue (bounds: Mon-Tue)
+          AAPL: synced Mon only (bounds: Mon-Mon)
 
-        Query: both tickers Mon-Wed
+        Query: both tickers Mon-Fri
 
-        Cover solver finds optimal solution: one call for both tickers Mon-Tue
-        (doesn't overfetch Wed since both already have it cached)
+        Cover solver batches:
+        - MSFT needs Wed-Fri (future gap)
+        - AAPL needs Tue-Fri (future gap, longer)
+        Both are future gaps, solver should batch them into one call
         """
-        # Setup: Cache MSFT for Mon and Wed
-        sep.query(columns=['close'], ticker='MSFT', date_gte='2020-08-31', date_lte='2020-08-31')
-        sep.query(columns=['close'], ticker='MSFT', date_gte='2020-09-02', date_lte='2020-09-02')
-        # Setup: Cache AAPL for Wed only
-        sep.query(columns=['close'], ticker='AAPL', date_gte='2020-09-02', date_lte='2020-09-02')
+        # Setup: Cache MSFT for Mon-Tue
+        sep.query(columns=['close'], ticker='MSFT', date_gte='2020-08-31', date_lte='2020-09-01')
+        # Setup: Cache AAPL for Mon only
+        sep.query(columns=['close'], ticker='AAPL', date_gte='2020-08-31', date_lte='2020-08-31')
 
         setup_calls = len(track_api_calls)
-        assert setup_calls == 3, f"Setup should make 3 calls, got {setup_calls}"
+        assert setup_calls == 2, f"Setup should make 2 calls, got {setup_calls}"
 
-        # Now query both tickers for Mon-Wed
+        # Now query both tickers for Mon-Fri
         df = sep.query(
             columns=['close'],
             ticker=['MSFT', 'AAPL'],
             date_gte='2020-08-31',
-            date_lte='2020-09-02'
+            date_lte='2020-09-04'
         )
 
-        # Should have all 6 rows (2 tickers × 3 days)
-        assert len(df) == 6, f"Expected 6 rows, got {len(df)}"
+        # Should have all 10 rows (2 tickers × 5 days)
+        assert len(df) == 10, f"Expected 10 rows, got {len(df)}"
 
-        # Cover solver makes only 1 additional call (batched for gaps only)
-        assert len(track_api_calls) == 4, \
-            f"Expected 4 total calls (3 setup + 1 gap-fill), got {len(track_api_calls)}"
+        # Cover solver batches future gaps: 1 call for both tickers Tue-Fri
+        # (MSFT gap is Wed-Fri, AAPL gap is Tue-Fri, solver uses longest)
+        assert len(track_api_calls) == 3, \
+            f"Expected 3 total calls (2 setup + 1 batched gap-fill), got {len(track_api_calls)}"
 
-        # The gap-fill call requests both tickers for Mon-Tue (not Wed, already cached)
-        gap_fill_call = track_api_calls[3]
+        # The gap-fill call requests both tickers
+        gap_fill_call = track_api_calls[2]
         ticker_arg = gap_fill_call['kwargs'].get('ticker')
         assert set(ticker_arg) == {'MSFT', 'AAPL'}, f"Expected both tickers, got {ticker_arg}"
+        # Date range covers the longer gap (Tue-Fri for AAPL, overfetches for MSFT)
         date_filter = gap_fill_call['kwargs'].get('date', {})
-        assert date_filter.get('gte') == '2020-08-31'
-        assert date_filter.get('lte') == '2020-09-01'  # Mon-Tue, not Wed
+        assert date_filter.get('gte') == '2020-09-01', f"Gap should start Tue, got {date_filter}"
+        assert date_filter.get('lte') == '2020-09-04', f"Gap should end Fri, got {date_filter}"
 
 
 class TestFilterSplitting:

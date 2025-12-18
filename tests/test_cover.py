@@ -4,20 +4,19 @@ Tests for the set-cover solver.
 Uses small page limits (10 rows) to make the problem tractable for testing.
 Assumes 1 ticker × 1 day = 1 row for simplicity.
 
-Key constraint: We can select arbitrary sets of tickers, but only
-contiguous date ranges (API uses date.gte/date.lte).
+Key insight: Gaps only occur at boundaries (before synced_from or after synced_to).
 """
 import pytest
-from cover import Gap, Request, solve_cover
+from cover import Gap, Request, solve_cover, find_gaps
 
 
 class TestGap:
     def test_days_single(self):
-        g = Gap('AAPL', '2024-01-01', '2024-01-01')
+        g = Gap('AAPL', '2024-01-01', '2024-01-01', is_past_gap=True)
         assert g.days() == 1
 
     def test_days_range(self):
-        g = Gap('AAPL', '2024-01-01', '2024-01-10')
+        g = Gap('AAPL', '2024-01-01', '2024-01-10', is_past_gap=True)
         assert g.days() == 10
 
 
@@ -32,27 +31,89 @@ class TestRequest:
 
     def test_covers_exact(self):
         r = Request(frozenset(['AAPL']), '2024-01-01', '2024-01-05')
-        g = Gap('AAPL', '2024-01-01', '2024-01-05')
+        g = Gap('AAPL', '2024-01-01', '2024-01-05', is_past_gap=True)
         assert r.covers(g)
 
     def test_covers_subset(self):
         r = Request(frozenset(['AAPL']), '2024-01-01', '2024-01-10')
-        g = Gap('AAPL', '2024-01-03', '2024-01-05')
+        g = Gap('AAPL', '2024-01-03', '2024-01-05', is_past_gap=True)
         assert r.covers(g)
 
     def test_not_covers_wrong_ticker(self):
         r = Request(frozenset(['AAPL']), '2024-01-01', '2024-01-10')
-        g = Gap('MSFT', '2024-01-01', '2024-01-05')
+        g = Gap('MSFT', '2024-01-01', '2024-01-05', is_past_gap=True)
         assert not r.covers(g)
 
     def test_not_covers_outside_range(self):
         r = Request(frozenset(['AAPL']), '2024-01-01', '2024-01-05')
-        g = Gap('AAPL', '2024-01-03', '2024-01-10')
+        g = Gap('AAPL', '2024-01-03', '2024-01-10', is_past_gap=True)
         assert not r.covers(g)
 
 
+class TestFindGaps:
+    """Test the bounds-based gap finding."""
+
+    def test_no_sync_bounds(self):
+        """Ticker with no sync record = full query range gap."""
+        gaps = find_gaps(['AAPL'], '2024-01-01', '2024-01-10', {})
+        assert len(gaps) == 1
+        assert gaps[0].ticker == 'AAPL'
+        assert gaps[0].start == '2024-01-01'
+        assert gaps[0].end == '2024-01-10'
+
+    def test_fully_synced(self):
+        """Query within sync bounds = no gaps."""
+        sync_bounds = {'AAPL': ('2024-01-01', '2024-01-31')}
+        gaps = find_gaps(['AAPL'], '2024-01-05', '2024-01-20', sync_bounds)
+        assert len(gaps) == 0
+
+    def test_gap_before_synced(self):
+        """Query starts before synced_from = past gap."""
+        sync_bounds = {'AAPL': ('2024-01-15', '2024-01-31')}
+        gaps = find_gaps(['AAPL'], '2024-01-01', '2024-01-20', sync_bounds)
+        assert len(gaps) == 1
+        assert gaps[0].start == '2024-01-01'
+        assert gaps[0].end == '2024-01-14'
+        assert gaps[0].is_past_gap
+
+    def test_gap_after_synced(self):
+        """Query ends after synced_to = future gap."""
+        sync_bounds = {'AAPL': ('2024-01-01', '2024-01-15')}
+        gaps = find_gaps(['AAPL'], '2024-01-10', '2024-01-31', sync_bounds)
+        assert len(gaps) == 1
+        assert gaps[0].start == '2024-01-16'
+        assert gaps[0].end == '2024-01-31'
+        assert not gaps[0].is_past_gap
+
+    def test_gaps_both_sides(self):
+        """Query extends both before and after = two gaps."""
+        sync_bounds = {'AAPL': ('2024-01-10', '2024-01-20')}
+        gaps = find_gaps(['AAPL'], '2024-01-01', '2024-01-31', sync_bounds)
+        assert len(gaps) == 2
+        past_gap = next(g for g in gaps if g.is_past_gap)
+        future_gap = next(g for g in gaps if not g.is_past_gap)
+        assert past_gap.start == '2024-01-01'
+        assert past_gap.end == '2024-01-09'
+        assert future_gap.start == '2024-01-21'
+        assert future_gap.end == '2024-01-31'
+
+    def test_multiple_tickers_mixed(self):
+        """Multiple tickers with different sync states."""
+        sync_bounds = {
+            'AAPL': ('2024-01-10', '2024-01-20'),  # Partial sync
+            'MSFT': None,  # Not synced
+        }
+        gaps = find_gaps(['AAPL', 'MSFT'], '2024-01-01', '2024-01-31', sync_bounds)
+
+        aapl_gaps = [g for g in gaps if g.ticker == 'AAPL']
+        msft_gaps = [g for g in gaps if g.ticker == 'MSFT']
+
+        assert len(aapl_gaps) == 2  # before and after
+        assert len(msft_gaps) == 1  # full range
+
+
 class TestSolveCover:
-    """Test the greedy set-cover solver with max_rows=10."""
+    """Test the boundary-aware set-cover solver with max_rows=10."""
 
     def test_empty_gaps(self):
         """No gaps = no requests."""
@@ -60,7 +121,7 @@ class TestSolveCover:
 
     def test_single_gap_fits(self):
         """Single gap under limit = one request."""
-        gaps = [Gap('AAPL', '2024-01-01', '2024-01-05')]  # 5 rows
+        gaps = [Gap('AAPL', '2024-01-01', '2024-01-05', is_past_gap=True)]  # 5 rows
         requests = solve_cover(gaps, max_rows=10)
 
         assert len(requests) == 1
@@ -68,31 +129,27 @@ class TestSolveCover:
 
     def test_single_gap_exact_limit(self):
         """Single gap at exactly the limit."""
-        gaps = [Gap('AAPL', '2024-01-01', '2024-01-10')]  # 10 rows
+        gaps = [Gap('AAPL', '2024-01-01', '2024-01-10', is_past_gap=True)]  # 10 rows
         requests = solve_cover(gaps, max_rows=10)
 
         assert len(requests) == 1
         assert requests[0].covers(gaps[0])
 
     def test_single_gap_exceeds_limit(self):
-        """Single gap over limit must be split by dates."""
-        gaps = [Gap('AAPL', '2024-01-01', '2024-01-15')]  # 15 rows
+        """Single gap over limit - solver can't split, returns oversized request."""
+        # Note: The solver doesn't split gaps; that's handled by _split_filters in cache.py
+        gaps = [Gap('AAPL', '2024-01-01', '2024-01-15', is_past_gap=True)]  # 15 rows
         requests = solve_cover(gaps, max_rows=10)
 
-        # Need at least 2 requests
-        assert len(requests) >= 2
-
-        # All parts of the gap should be covered
-        for day in range(1, 16):
-            date = f'2024-01-{day:02d}'
-            day_gap = Gap('AAPL', date, date)
-            assert any(r.covers(day_gap) for r in requests), f"Day {date} not covered"
+        # Solver returns single request (splitting happens elsewhere)
+        assert len(requests) == 1
+        assert requests[0].covers(gaps[0])
 
     def test_two_tickers_same_dates_fit(self):
         """Two tickers with same dates that fit together."""
         gaps = [
-            Gap('AAPL', '2024-01-01', '2024-01-04'),  # 4 rows
-            Gap('MSFT', '2024-01-01', '2024-01-04'),  # 4 rows
+            Gap('AAPL', '2024-01-01', '2024-01-04', is_past_gap=True),  # 4 rows
+            Gap('MSFT', '2024-01-01', '2024-01-04', is_past_gap=True),  # 4 rows
         ]  # Total: 8 rows, fits in 10
         requests = solve_cover(gaps, max_rows=10)
 
@@ -102,84 +159,59 @@ class TestSolveCover:
     def test_two_tickers_same_dates_exceed(self):
         """Two tickers with same dates that don't fit together."""
         gaps = [
-            Gap('AAPL', '2024-01-01', '2024-01-06'),  # 6 rows
-            Gap('MSFT', '2024-01-01', '2024-01-06'),  # 6 rows
+            Gap('AAPL', '2024-01-01', '2024-01-06', is_past_gap=True),  # 6 rows
+            Gap('MSFT', '2024-01-01', '2024-01-06', is_past_gap=True),  # 6 rows
         ]  # Total: 12 rows, needs 2 requests
         requests = solve_cover(gaps, max_rows=10)
 
         assert len(requests) >= 2  # Can't fit in 1
-        # All cells must be covered
-        needed = set().union(*(g.cells() for g in gaps))
-        covered = set().union(*(r.cells() for r in requests))
-        assert needed <= covered
+        assert all(any(r.covers(g) for r in requests) for g in gaps)
 
     def test_batch_tickers_with_same_gap(self):
         """Multiple tickers with identical gaps should batch efficiently."""
         gaps = [
-            Gap('AAPL', '2024-01-01', '2024-01-02'),  # 2 rows
-            Gap('MSFT', '2024-01-01', '2024-01-02'),  # 2 rows
-            Gap('GOOGL', '2024-01-01', '2024-01-02'),  # 2 rows
-            Gap('AMZN', '2024-01-01', '2024-01-02'),  # 2 rows
+            Gap('AAPL', '2024-01-01', '2024-01-02', is_past_gap=True),
+            Gap('MSFT', '2024-01-01', '2024-01-02', is_past_gap=True),
+            Gap('GOOGL', '2024-01-01', '2024-01-02', is_past_gap=True),
+            Gap('AMZN', '2024-01-01', '2024-01-02', is_past_gap=True),
         ]  # Total: 8 rows, fits in one request
         requests = solve_cover(gaps, max_rows=10)
 
         assert len(requests) == 1
         assert all(requests[0].covers(g) for g in gaps)
 
-    def test_overfetch_is_acceptable(self):
-        """Solver may overfetch to reduce request count."""
+    def test_past_and_future_gaps_separate(self):
+        """Past and future gaps are batched separately."""
         gaps = [
-            Gap('AAPL', '2024-01-01', '2024-01-01'),  # Day 1
-            Gap('AAPL', '2024-01-03', '2024-01-03'),  # Day 3 (gap on day 2)
+            Gap('AAPL', '2024-01-01', '2024-01-05', is_past_gap=True),   # past
+            Gap('MSFT', '2024-01-01', '2024-01-05', is_past_gap=True),   # past
+            Gap('AAPL', '2024-02-01', '2024-02-05', is_past_gap=False),  # future
+            Gap('MSFT', '2024-02-01', '2024-02-05', is_past_gap=False),  # future
         ]
         requests = solve_cover(gaps, max_rows=10)
 
-        # Could be 1 request (days 1-3, overfetching day 2) or 2 requests
-        # Greedy should prefer 1 request with overfetch
-        assert len(requests) <= 2
-        assert all(any(r.covers(g) for r in requests) for g in gaps)
-
-    def test_different_date_ranges(self):
-        """Tickers with completely different date ranges need separate requests."""
-        gaps = [
-            Gap('AAPL', '2024-01-01', '2024-01-05'),  # 5 rows
-            Gap('MSFT', '2024-06-01', '2024-06-05'),  # 5 rows, 150+ days apart
-        ]
-        requests = solve_cover(gaps, max_rows=10)
-
-        # These can't be batched (would be 2 tickers × 150+ days > 10)
+        # Should batch into 2 requests: one for past, one for future
         assert len(requests) == 2
         assert all(any(r.covers(g) for r in requests) for g in gaps)
 
-    def test_complex_scenario(self):
-        """
-        Complex scenario with overlapping and non-overlapping gaps.
-
-        AAPL: days 1-3, 5-7 (two gaps)
-        MSFT: days 2-4 (overlaps with AAPL's first gap)
-        GOOGL: days 10-12 (separate)
-
-        Optimal: ~2-3 requests depending on strategy
-        """
+    def test_different_length_past_gaps_batch(self):
+        """Past gaps with different lengths can still batch (overfetch shorter ones)."""
         gaps = [
-            Gap('AAPL', '2024-01-01', '2024-01-03'),
-            Gap('AAPL', '2024-01-05', '2024-01-07'),
-            Gap('MSFT', '2024-01-02', '2024-01-04'),
-            Gap('GOOGL', '2024-01-10', '2024-01-12'),
+            Gap('AAPL', '2024-01-01', '2024-01-05', is_past_gap=True),  # 5 days
+            Gap('MSFT', '2024-01-01', '2024-01-03', is_past_gap=True),  # 3 days (shorter)
         ]
         requests = solve_cover(gaps, max_rows=10)
 
-        # All cells must be covered
-        needed = set().union(*(g.cells() for g in gaps))
-        covered = set().union(*(r.cells() for r in requests))
-        assert needed <= covered
-
-        # Should be reasonably efficient (not 4 separate requests)
-        assert len(requests) <= 3
+        # Should batch into 1 request covering 01-01 to 01-05 for both
+        assert len(requests) == 1
+        # Request covers the longer gap
+        assert requests[0].covers(gaps[0])
+        # And overfetches for the shorter gap
+        assert requests[0].covers(gaps[1])
 
     def test_many_small_gaps_batch_efficiently(self):
         """Many 1-day gaps for different tickers should batch."""
-        gaps = [Gap(f'T{i}', '2024-01-01', '2024-01-01') for i in range(8)]
+        gaps = [Gap(f'T{i}', '2024-01-01', '2024-01-01', is_past_gap=True) for i in range(8)]
         requests = solve_cover(gaps, max_rows=10)
 
         # 8 tickers × 1 day = 8 rows, fits in one request
@@ -189,10 +221,11 @@ class TestSolveCover:
     def test_respects_max_rows(self):
         """All returned requests must be under max_rows."""
         gaps = [
-            Gap('AAPL', '2024-01-01', '2024-01-10'),
-            Gap('MSFT', '2024-01-01', '2024-01-10'),
-            Gap('GOOGL', '2024-01-01', '2024-01-10'),
-        ]
+            Gap('AAPL', '2024-01-01', '2024-01-03', is_past_gap=True),
+            Gap('MSFT', '2024-01-01', '2024-01-03', is_past_gap=True),
+            Gap('GOOGL', '2024-01-01', '2024-01-03', is_past_gap=True),
+            Gap('AMZN', '2024-01-01', '2024-01-03', is_past_gap=True),
+        ]  # 4 tickers × 3 days = 12 rows
         requests = solve_cover(gaps, max_rows=10)
 
         for r in requests:
