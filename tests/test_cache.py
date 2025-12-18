@@ -92,6 +92,21 @@ def sep():
         table.conn.close()
 
 
+@pytest.fixture
+def track_api_calls():
+    """Track NDL API calls made during a test."""
+    api_calls = []
+    original = cache.ndl.get_table
+
+    def tracking_mock(*args, **kwargs):
+        api_calls.append({'args': args, 'kwargs': kwargs})
+        return original(*args, **kwargs)
+
+    cache.ndl.get_table = tracking_mock
+    yield api_calls
+    cache.ndl.get_table = original
+
+
 class TestImmutableData:
     """Test the immutable_data transformation."""
 
@@ -381,164 +396,248 @@ class TestTableSchema:
 class TestSetIntersection:
     """Test that the cache respects set intersections to avoid redundant queries."""
 
-    def test_multi_ticker_no_double_query(self, sep):
+    def test_multi_ticker_no_double_query(self, sep, track_api_calls):
         """
         Query MSFT alone, then MSFT+AAPL together.
-        MSFT should not be re-fetched from the API.
+        Second query uses overfetch strategy (re-fetches MSFT with AAPL).
         """
-        api_calls = []
+        # First query: just MSFT
+        df1 = sep.query(
+            columns=['close'],
+            ticker='MSFT',
+            date_gte='2020-08-28',
+            date_lte='2020-08-28'
+        )
+        assert len(df1) == 1
+        assert df1['ticker'].iloc[0] == 'MSFT'
+        assert len(track_api_calls) == 1, "Should have made exactly 1 API call for MSFT"
 
-        # Wrap mock to track calls
-        original_mock = cache.ndl.get_table
+        # Second query: MSFT + AAPL
+        df2 = sep.query(
+            columns=['close'],
+            ticker=['MSFT', 'AAPL'],
+            date_gte='2020-08-28',
+            date_lte='2020-08-28'
+        )
+        assert len(df2) == 2
+        assert set(df2['ticker'].tolist()) == {'MSFT', 'AAPL'}
 
-        def tracking_mock(*args, **kwargs):
-            api_calls.append({'args': args, 'kwargs': kwargs})
-            return original_mock(*args, **kwargs)
+        # With overfetch strategy: one call for both tickers (re-fetches MSFT)
+        assert len(track_api_calls) == 2, f"Expected 2 total API calls, got {len(track_api_calls)}"
 
-        cache.ndl.get_table = tracking_mock
+        # Second call fetches both tickers (overfetch is OK)
+        second_call = track_api_calls[1]
+        ticker_arg = second_call['kwargs'].get('ticker')
+        assert ticker_arg == ['MSFT', 'AAPL'], \
+            f"Second API call should request both tickers, got ticker={ticker_arg}"
 
-        try:
-            # First query: just MSFT
-            df1 = sep.query(
-                columns=['close'],
-                ticker='MSFT',
-                date_gte='2020-08-28',
-                date_lte='2020-08-28'
-            )
-            assert len(df1) == 1
-            assert df1['ticker'].iloc[0] == 'MSFT'
-
-            first_call_count = len(api_calls)
-            assert first_call_count == 1, "Should have made exactly 1 API call for MSFT"
-
-            # Second query: MSFT + AAPL
-            df2 = sep.query(
-                columns=['close'],
-                ticker=['MSFT', 'AAPL'],
-                date_gte='2020-08-28',
-                date_lte='2020-08-28'
-            )
-            assert len(df2) == 2
-            assert set(df2['ticker'].tolist()) == {'MSFT', 'AAPL'}
-
-            # Should only have made ONE additional call for AAPL (not MSFT again)
-            assert len(api_calls) == 2, f"Expected 2 total API calls, got {len(api_calls)}"
-
-            # Verify second call was only for AAPL
-            second_call = api_calls[1]
-            ticker_arg = second_call['kwargs'].get('ticker')
-            assert ticker_arg == 'AAPL' or ticker_arg == ['AAPL'], \
-                f"Second API call should only request AAPL, got ticker={ticker_arg}"
-
-        finally:
-            cache.ndl.get_table = original_mock
-
-    def test_date_range_no_double_query(self, sep):
+    def test_date_range_no_double_query(self, sep, track_api_calls):
         """
         Query Monday alone, then Monday+Tuesday together.
         Monday should not be re-fetched from the API.
         """
-        api_calls = []
+        # First query: just Monday (2020-08-31)
+        df1 = sep.query(
+            columns=['close'],
+            ticker='AAPL',
+            date_gte='2020-08-31',
+            date_lte='2020-08-31'
+        )
+        assert len(df1) == 1
+        assert str(df1['date'].iloc[0])[:10] == '2020-08-31'
+        assert len(track_api_calls) == 1, "Should have made exactly 1 API call for Monday"
 
-        # Wrap mock to track calls
-        original_mock = cache.ndl.get_table
+        # Second query: Monday + Tuesday (2020-08-31 to 2020-09-01)
+        df2 = sep.query(
+            columns=['close'],
+            ticker='AAPL',
+            date_gte='2020-08-31',
+            date_lte='2020-09-01'
+        )
+        assert len(df2) == 2
 
-        def tracking_mock(*args, **kwargs):
-            api_calls.append({'args': args, 'kwargs': kwargs})
-            return original_mock(*args, **kwargs)
+        # Should only have made ONE additional call for Tuesday (not Monday again)
+        assert len(track_api_calls) == 2, f"Expected 2 total API calls, got {len(track_api_calls)}"
 
-        cache.ndl.get_table = tracking_mock
+        # Verify second call was only for Tuesday
+        second_call = track_api_calls[1]
+        date_filter = second_call['kwargs'].get('date', {})
+        assert date_filter.get('gte') == '2020-09-01', \
+            f"Second API call should start from Tuesday, got {date_filter}"
 
-        try:
-            # First query: just Monday (2020-08-31)
-            df1 = sep.query(
-                columns=['close'],
-                ticker='AAPL',
-                date_gte='2020-08-31',
-                date_lte='2020-08-31'
-            )
-            assert len(df1) == 1
-            assert str(df1['date'].iloc[0])[:10] == '2020-08-31'
-
-            first_call_count = len(api_calls)
-            assert first_call_count == 1, "Should have made exactly 1 API call for Monday"
-
-            # Second query: Monday + Tuesday (2020-08-31 to 2020-09-01)
-            df2 = sep.query(
-                columns=['close'],
-                ticker='AAPL',
-                date_gte='2020-08-31',
-                date_lte='2020-09-01'
-            )
-            assert len(df2) == 2
-
-            # Should only have made ONE additional call for Tuesday (not Monday again)
-            assert len(api_calls) == 2, f"Expected 2 total API calls, got {len(api_calls)}"
-
-            # Verify second call was only for Tuesday
-            second_call = api_calls[1]
-            date_filter = second_call['kwargs'].get('date', {})
-            assert date_filter.get('gte') == '2020-09-01', \
-                f"Second API call should start from Tuesday, got {date_filter}"
-
-        finally:
-            cache.ndl.get_table = original_mock
-
-    def test_date_range_gap_fill(self, sep):
+    def test_date_range_gap_fill(self, sep, track_api_calls):
         """
         Query Monday, then Wednesday, then Monday-Wednesday.
         The third query should only fetch Tuesday (the gap).
         """
-        api_calls = []
+        # First query: Monday (2020-08-31)
+        df1 = sep.query(
+            columns=['close'],
+            ticker='AAPL',
+            date_gte='2020-08-31',
+            date_lte='2020-08-31'
+        )
+        assert len(df1) == 1
+        assert len(track_api_calls) == 1
 
-        original_mock = cache.ndl.get_table
+        # Second query: Wednesday (2020-09-02)
+        df2 = sep.query(
+            columns=['close'],
+            ticker='AAPL',
+            date_gte='2020-09-02',
+            date_lte='2020-09-02'
+        )
+        assert len(df2) == 1
+        assert len(track_api_calls) == 2
 
-        def tracking_mock(*args, **kwargs):
-            api_calls.append({'args': args, 'kwargs': kwargs})
-            return original_mock(*args, **kwargs)
+        # Third query: Monday through Wednesday
+        df3 = sep.query(
+            columns=['close'],
+            ticker='AAPL',
+            date_gte='2020-08-31',
+            date_lte='2020-09-02'
+        )
+        assert len(df3) == 3
 
-        cache.ndl.get_table = tracking_mock
+        # Should have made exactly ONE more call for Tuesday only
+        assert len(track_api_calls) == 3, f"Expected 3 total API calls, got {len(track_api_calls)}"
 
-        try:
-            # First query: Monday (2020-08-31)
-            df1 = sep.query(
-                columns=['close'],
-                ticker='AAPL',
-                date_gte='2020-08-31',
-                date_lte='2020-08-31'
-            )
-            assert len(df1) == 1
-            assert len(api_calls) == 1
+        # Verify third call was only for Tuesday
+        third_call = track_api_calls[2]
+        date_filter = third_call['kwargs'].get('date', {})
+        assert date_filter.get('gte') == '2020-09-01', \
+            f"Third API call should start from Tuesday, got {date_filter}"
+        assert date_filter.get('lte') == '2020-09-01', \
+            f"Third API call should end on Tuesday, got {date_filter}"
 
-            # Second query: Wednesday (2020-09-02)
-            df2 = sep.query(
-                columns=['close'],
-                ticker='AAPL',
-                date_gte='2020-09-02',
-                date_lte='2020-09-02'
-            )
-            assert len(df2) == 1
-            assert len(api_calls) == 2
+    def test_multi_ticker_different_gaps(self, sep, track_api_calls):
+        """
+        Query MSFT Mon-Wed, then AAPL Wed-Fri, then both Mon-Fri.
+        With overfetch strategy, third query makes ONE call for full rectangle.
+        """
+        # First query: MSFT Monday-Wednesday (2020-08-31 to 2020-09-02)
+        df1 = sep.query(
+            columns=['close'],
+            ticker='MSFT',
+            date_gte='2020-08-31',
+            date_lte='2020-09-02'
+        )
+        assert len(df1) == 3
+        assert df1['ticker'].iloc[0] == 'MSFT'
+        assert len(track_api_calls) == 1
 
-            # Third query: Monday through Wednesday
-            df3 = sep.query(
-                columns=['close'],
-                ticker='AAPL',
-                date_gte='2020-08-31',
-                date_lte='2020-09-02'
-            )
-            assert len(df3) == 3
+        # Second query: AAPL Wednesday-Friday (2020-09-02 to 2020-09-04)
+        df2 = sep.query(
+            columns=['close'],
+            ticker='AAPL',
+            date_gte='2020-09-02',
+            date_lte='2020-09-04'
+        )
+        assert len(df2) == 3
+        assert df2['ticker'].iloc[0] == 'AAPL'
+        assert len(track_api_calls) == 2
 
-            # Should have made exactly ONE more call for Tuesday only
-            assert len(api_calls) == 3, f"Expected 3 total API calls, got {len(api_calls)}"
+        # Third query: Both tickers Monday-Friday
+        df3 = sep.query(
+            columns=['close'],
+            ticker=['MSFT', 'AAPL'],
+            date_gte='2020-08-31',
+            date_lte='2020-09-04'
+        )
+        # 5 trading days * 2 tickers = 10 rows
+        assert len(df3) == 10, f"Expected 10 rows, got {len(df3)}"
+        assert set(df3['ticker'].unique()) == {'MSFT', 'AAPL'}
 
-            # Verify third call was only for Tuesday
-            third_call = api_calls[2]
-            date_filter = third_call['kwargs'].get('date', {})
-            assert date_filter.get('gte') == '2020-09-01', \
-                f"Third API call should start from Tuesday, got {date_filter}"
-            assert date_filter.get('lte') == '2020-09-01', \
-                f"Third API call should end on Tuesday, got {date_filter}"
+        # With overfetch: ONE call for full rectangle (both tickers × Mon-Fri)
+        assert len(track_api_calls) == 3, f"Expected 3 total API calls, got {len(track_api_calls)}"
 
-        finally:
-            cache.ndl.get_table = original_mock
+        # Verify overfetch call covers full rectangle
+        overfetch_call = track_api_calls[2]
+        assert overfetch_call['kwargs'].get('ticker') == ['MSFT', 'AAPL']
+        date_filter = overfetch_call['kwargs'].get('date', {})
+        assert date_filter.get('gte') == '2020-08-31'
+        assert date_filter.get('lte') == '2020-09-04'
+
+    def test_multi_ticker_same_gap_batched(self, sep, track_api_calls):
+        """
+        Query MSFT+AAPL for Monday, then for Tuesday.
+        Both queries should make ONE batched API call for both tickers.
+        """
+        # First query: Both tickers Monday (2020-08-31)
+        df1 = sep.query(
+            columns=['close'],
+            ticker=['MSFT', 'AAPL'],
+            date_gte='2020-08-31',
+            date_lte='2020-08-31'
+        )
+        assert len(df1) == 2
+        assert set(df1['ticker'].tolist()) == {'MSFT', 'AAPL'}
+        # One batched call for both tickers
+        assert len(track_api_calls) == 1
+        assert track_api_calls[0]['kwargs'].get('ticker') == ['MSFT', 'AAPL']
+
+        # Second query: Both tickers Tuesday (2020-09-01)
+        df2 = sep.query(
+            columns=['close'],
+            ticker=['MSFT', 'AAPL'],
+            date_gte='2020-09-01',
+            date_lte='2020-09-01'
+        )
+        assert len(df2) == 2
+        assert set(df2['ticker'].tolist()) == {'MSFT', 'AAPL'}
+
+        # Should make only ONE additional batched call for both tickers
+        assert len(track_api_calls) == 2, \
+            f"Expected 2 total API calls (1 initial + 1 batched), got {len(track_api_calls)}"
+
+        # Verify the second call includes both tickers
+        second_call = track_api_calls[1]
+        ticker_arg = second_call['kwargs'].get('ticker')
+        assert ticker_arg == ['MSFT', 'AAPL'], \
+            f"Second call should request both tickers, got {ticker_arg}"
+
+    def test_overfetch_to_minimize_calls(self, sep, track_api_calls):
+        """
+        When tickers have different gaps, prefer one overfetching call
+        over multiple exact-coverage calls.
+
+        Cache state:
+          MSFT: has Mon, Wed (missing Tue)
+          AAPL: has Wed only (missing Mon, Tue)
+
+        Query: both tickers Mon-Wed
+
+        Old behavior: 2 calls (MSFT×Tue, AAPL×Mon-Tue)
+        New behavior: 1 call (both×Mon-Wed) with overfetch
+        """
+        # Setup: Cache MSFT for Mon and Wed
+        sep.query(columns=['close'], ticker='MSFT', date_gte='2020-08-31', date_lte='2020-08-31')
+        sep.query(columns=['close'], ticker='MSFT', date_gte='2020-09-02', date_lte='2020-09-02')
+        # Setup: Cache AAPL for Wed only
+        sep.query(columns=['close'], ticker='AAPL', date_gte='2020-09-02', date_lte='2020-09-02')
+
+        setup_calls = len(track_api_calls)
+        assert setup_calls == 3, f"Setup should make 3 calls, got {setup_calls}"
+
+        # Now query both tickers for Mon-Wed
+        df = sep.query(
+            columns=['close'],
+            ticker=['MSFT', 'AAPL'],
+            date_gte='2020-08-31',
+            date_lte='2020-09-02'
+        )
+
+        # Should have all 6 rows (2 tickers × 3 days)
+        assert len(df) == 6, f"Expected 6 rows, got {len(df)}"
+
+        # Should make only 1 additional call (overfetching full rectangle)
+        # NOT 2 calls (one for MSFT×Tue, one for AAPL×Mon-Tue)
+        assert len(track_api_calls) == 4, \
+            f"Expected 4 total calls (3 setup + 1 overfetch), got {len(track_api_calls)}"
+
+        # The overfetch call should request both tickers for full date range
+        overfetch_call = track_api_calls[3]
+        assert overfetch_call['kwargs'].get('ticker') == ['MSFT', 'AAPL']
+        date_filter = overfetch_call['kwargs'].get('date', {})
+        assert date_filter.get('gte') == '2020-08-31'
+        assert date_filter.get('lte') == '2020-09-02'

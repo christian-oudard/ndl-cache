@@ -126,6 +126,72 @@ class CachedTable:
             WHERE {where}
         """, params).df()
 
+    def _compute_date_gaps(self, cached_data: pd.DataFrame, date_gte: str, date_lte: str) -> list[tuple[str, str]]:
+        """
+        Compute date range gaps in cached data.
+        Returns list of (gap_start, gap_end) tuples.
+        """
+        if not (date_gte and date_lte):
+            return []
+
+        if 'date' not in cached_data.columns or len(cached_data) == 0:
+            return [(date_gte, date_lte)]
+
+        cached_dates = set(str(d)[:10] for d in cached_data['date'])
+        if not cached_dates:
+            return [(date_gte, date_lte)]
+
+        cached_min = min(cached_dates)
+        cached_max = max(cached_dates)
+        gaps = []
+
+        # Gap before cached range
+        if date_gte < cached_min:
+            day_before_min = (datetime.strptime(cached_min, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
+            gaps.append((date_gte, day_before_min))
+
+        # Gap after cached range
+        if date_lte > cached_max:
+            day_after_max = (datetime.strptime(cached_max, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+            gaps.append((day_after_max, date_lte))
+
+        # Gaps within cached range
+        if cached_min <= date_gte and date_lte <= cached_max:
+            start = datetime.strptime(date_gte, '%Y-%m-%d')
+            end = datetime.strptime(date_lte, '%Y-%m-%d')
+            gap_start = None
+            current = start
+            while current <= end:
+                date_str = current.strftime('%Y-%m-%d')
+                if date_str not in cached_dates:
+                    if gap_start is None:
+                        gap_start = date_str
+                    gap_end = date_str
+                else:
+                    if gap_start is not None:
+                        gaps.append((gap_start, gap_end))
+                        gap_start = None
+                current += timedelta(days=1)
+            if gap_start is not None:
+                gaps.append((gap_start, gap_end))
+
+        return gaps
+
+    def _fill_date_gaps(self, cached_data: pd.DataFrame, filters: dict) -> bool:
+        """
+        Check for date range gaps in cached data and fetch missing dates.
+        Returns True if any data was fetched.
+        """
+        gaps = self._compute_date_gaps(
+            cached_data,
+            filters.get('date_gte'),
+            filters.get('date_lte')
+        )
+        for gap_start, gap_end in gaps:
+            gap_filters = {**filters, 'date_gte': gap_start, 'date_lte': gap_end}
+            self.sync(**gap_filters)
+        return len(gaps) > 0
+
     def query(self, columns: list[str] | str | None = None, **filters) -> pd.DataFrame:
         """
         Query data, returning immutable and/or derived columns.
@@ -137,13 +203,42 @@ class CachedTable:
         # Determine what's missing and fetch it
         ticker_filter = filters.get('ticker')
         if isinstance(ticker_filter, list):
-            # Multi-ticker query: only fetch missing tickers
-            cached_tickers = set(immutable['ticker'].unique()) if len(immutable) > 0 else set()
-            missing_tickers = [t for t in ticker_filter if t not in cached_tickers]
-            for ticker in missing_tickers:
-                ticker_filters = {**filters, 'ticker': ticker}
-                self.sync(**ticker_filters)
-            if missing_tickers:
+            # Multi-ticker query: prefer single overfetch call if under page limit
+            date_gte = filters.get('date_gte')
+            date_lte = filters.get('date_lte')
+
+            # Check if any ticker has gaps
+            has_gaps = False
+            for ticker in ticker_filter:
+                ticker_data = immutable[immutable['ticker'] == ticker] if len(immutable) > 0 else pd.DataFrame()
+                if self._compute_date_gaps(ticker_data, date_gte, date_lte):
+                    has_gaps = True
+                    break
+
+            if has_gaps:
+                # Estimate rows for full rectangle
+                n_tickers = len(ticker_filter)
+                if date_gte and date_lte:
+                    start = datetime.strptime(date_gte, '%Y-%m-%d')
+                    end = datetime.strptime(date_lte, '%Y-%m-%d')
+                    calendar_days = (end - start).days + 1
+                    # Approximate trading days (252 per year)
+                    est_trading_days = max(1, int(calendar_days * 252 / 365))
+                else:
+                    est_trading_days = 1
+
+                est_rows = n_tickers * est_trading_days
+
+                if est_rows < 10000:
+                    # Single overfetch call for entire rectangle
+                    self.sync(**filters)
+                else:
+                    # Too many rows - fall back to per-ticker gap filling
+                    for ticker in ticker_filter:
+                        ticker_data = immutable[immutable['ticker'] == ticker] if len(immutable) > 0 else pd.DataFrame()
+                        ticker_filters = {**filters, 'ticker': ticker}
+                        self._fill_date_gaps(ticker_data, ticker_filters)
+
                 immutable = self.get_cached(**filters)
         elif len(immutable) == 0:
             # Cache empty: fetch everything
@@ -151,53 +246,8 @@ class CachedTable:
             immutable = self.get_cached(**filters)
         else:
             # Check for date range gaps
-            date_gte = filters.get('date_gte')
-            date_lte = filters.get('date_lte')
-            if date_gte and date_lte and 'date' in immutable.columns:
-                cached_dates = set(str(d)[:10] for d in immutable['date'])
-                cached_min = min(cached_dates)
-                cached_max = max(cached_dates)
-                needs_refetch = False
-                # Fetch dates before cached range
-                if date_gte < cached_min:
-                    day_before_min = (datetime.strptime(cached_min, '%Y-%m-%d') - timedelta(days=1)).strftime('%Y-%m-%d')
-                    before_filters = {**filters, 'date_lte': day_before_min}
-                    self.sync(**before_filters)
-                    needs_refetch = True
-                # Fetch dates after cached range
-                if date_lte > cached_max:
-                    day_after_max = (datetime.strptime(cached_max, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-                    after_filters = {**filters, 'date_gte': day_after_max}
-                    self.sync(**after_filters)
-                    needs_refetch = True
-                # Fetch gaps within cached range
-                if cached_min <= date_gte and date_lte <= cached_max:
-                    # Find contiguous gaps and fetch them
-                    start = datetime.strptime(date_gte, '%Y-%m-%d')
-                    end = datetime.strptime(date_lte, '%Y-%m-%d')
-                    gap_start = None
-                    current = start
-                    while current <= end:
-                        date_str = current.strftime('%Y-%m-%d')
-                        if date_str not in cached_dates:
-                            if gap_start is None:
-                                gap_start = date_str
-                            gap_end = date_str
-                        else:
-                            if gap_start is not None:
-                                # Fetch this gap
-                                gap_filters = {**filters, 'date_gte': gap_start, 'date_lte': gap_end}
-                                self.sync(**gap_filters)
-                                needs_refetch = True
-                                gap_start = None
-                        current += timedelta(days=1)
-                    # Handle trailing gap
-                    if gap_start is not None:
-                        gap_filters = {**filters, 'date_gte': gap_start, 'date_lte': gap_end}
-                        self.sync(**gap_filters)
-                        needs_refetch = True
-                if needs_refetch:
-                    immutable = self.get_cached(**filters)
+            if self._fill_date_gaps(immutable, filters):
+                immutable = self.get_cached(**filters)
 
         if len(immutable) == 0:
             return pd.DataFrame()
