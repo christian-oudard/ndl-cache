@@ -432,3 +432,113 @@ class TestSetIntersection:
 
         finally:
             cache.ndl.get_table = original_mock
+
+    def test_date_range_no_double_query(self, sep):
+        """
+        Query Monday alone, then Monday+Tuesday together.
+        Monday should not be re-fetched from the API.
+        """
+        api_calls = []
+
+        # Wrap mock to track calls
+        original_mock = cache.ndl.get_table
+
+        def tracking_mock(*args, **kwargs):
+            api_calls.append({'args': args, 'kwargs': kwargs})
+            return original_mock(*args, **kwargs)
+
+        cache.ndl.get_table = tracking_mock
+
+        try:
+            # First query: just Monday (2020-08-31)
+            df1 = sep.query(
+                columns=['close'],
+                ticker='AAPL',
+                date_gte='2020-08-31',
+                date_lte='2020-08-31'
+            )
+            assert len(df1) == 1
+            assert str(df1['date'].iloc[0])[:10] == '2020-08-31'
+
+            first_call_count = len(api_calls)
+            assert first_call_count == 1, "Should have made exactly 1 API call for Monday"
+
+            # Second query: Monday + Tuesday (2020-08-31 to 2020-09-01)
+            df2 = sep.query(
+                columns=['close'],
+                ticker='AAPL',
+                date_gte='2020-08-31',
+                date_lte='2020-09-01'
+            )
+            assert len(df2) == 2
+
+            # Should only have made ONE additional call for Tuesday (not Monday again)
+            assert len(api_calls) == 2, f"Expected 2 total API calls, got {len(api_calls)}"
+
+            # Verify second call was only for Tuesday
+            second_call = api_calls[1]
+            date_filter = second_call['kwargs'].get('date', {})
+            assert date_filter.get('gte') == '2020-09-01', \
+                f"Second API call should start from Tuesday, got {date_filter}"
+
+        finally:
+            cache.ndl.get_table = original_mock
+
+    def test_date_range_gap_fill(self, sep):
+        """
+        Query Monday, then Wednesday, then Monday-Wednesday.
+        The third query should only fetch Tuesday (the gap).
+        """
+        api_calls = []
+
+        original_mock = cache.ndl.get_table
+
+        def tracking_mock(*args, **kwargs):
+            api_calls.append({'args': args, 'kwargs': kwargs})
+            return original_mock(*args, **kwargs)
+
+        cache.ndl.get_table = tracking_mock
+
+        try:
+            # First query: Monday (2020-08-31)
+            df1 = sep.query(
+                columns=['close'],
+                ticker='AAPL',
+                date_gte='2020-08-31',
+                date_lte='2020-08-31'
+            )
+            assert len(df1) == 1
+            assert len(api_calls) == 1
+
+            # Second query: Wednesday (2020-09-02)
+            df2 = sep.query(
+                columns=['close'],
+                ticker='AAPL',
+                date_gte='2020-09-02',
+                date_lte='2020-09-02'
+            )
+            assert len(df2) == 1
+            assert len(api_calls) == 2
+
+            # Third query: Monday through Wednesday
+            df3 = sep.query(
+                columns=['close'],
+                ticker='AAPL',
+                date_gte='2020-08-31',
+                date_lte='2020-09-02'
+            )
+            assert len(df3) == 3
+
+            # Should have made exactly ONE more call for Tuesday only
+            assert len(api_calls) == 3, f"Expected 3 total API calls, got {len(api_calls)}"
+
+            # Verify third call was only for Tuesday
+            third_call = api_calls[2]
+            date_filter = third_call['kwargs'].get('date', {})
+            assert date_filter.get('gte') == '2020-09-01', \
+                f"Third API call should start from Tuesday, got {date_filter}"
+            assert date_filter.get('lte') == '2020-09-01', \
+                f"Third API call should end on Tuesday, got {date_filter}"
+
+        finally:
+            cache.ndl.get_table = original_mock

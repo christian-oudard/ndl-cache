@@ -83,5 +83,69 @@
       "closeadj": 219.052,
       "closeunadj": 228.91
     }
-  ]
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-31&date.lte=2020-08-31&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL": [
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 127.58,
+      "low": 126.0,
+      "high": 131.0,
+      "close": 129.04,
+      "volume": 223506000.0,
+      "closeadj": 125.411,
+      "closeunadj": 129.04
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-31&date.lte=2020-09-01&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL": [
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 132.76,
+      "low": 130.53,
+      "high": 134.8,
+      "close": 134.18,
+      "volume": 150699000.0,
+      "closeadj": 130.406,
+      "closeunadj": 134.18
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 127.58,
+      "low": 126.0,
+      "high": 131.0,
+      "close": 129.04,
+      "volume": 223506000.0,
+      "closeadj": 125.411,
+      "closeunadj": 129.04
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-09-01&date.lte=2020-09-01&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL": [
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 132.76,
+      "low": 130.53,
+      "high": 134.8,
+      "close": 134.18,
+      "volume": 150699000.0,
+      "closeadj": 130.406,
+      "closeunadj": 134.18
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-09-02&date.lte=2020-09-02&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL": [
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-02T00:00:00.000",
+      "open": 137.59,
+      "low": 127.0,
+      "high": 137.98,
+      "close": 131.4,
+      "volume": 198233000.0,
+      "closeadj": 127.705,
+      "closeunadj": 131.4
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-29&date.lte=2020-08-30&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL": []
 }
