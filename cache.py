@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import duckdb
 import warnings
+from cover import Gap, Request, solve_cover, find_gaps
 
 # Optimal parallelization level based on benchmarking ~10k row requests
 # Higher values hit server-side throttling with diminishing returns
@@ -139,6 +140,46 @@ class CachedTable:
 
         # Can't split further
         return [filters]
+
+    def _get_cached_cells(self, tickers: list[str], date_gte: str, date_lte: str) -> set[tuple[str, str]]:
+        """Get set of (ticker, date) cells currently in cache for given query."""
+        if not tickers or not date_gte or not date_lte:
+            return set()
+
+        cached = self.get_cached(ticker=tickers, date_gte=date_gte, date_lte=date_lte)
+        if len(cached) == 0:
+            return set()
+
+        return {(row['ticker'], str(row['date'])[:10]) for _, row in cached.iterrows()}
+
+    def _compute_optimal_fetches(
+        self,
+        tickers: list[str],
+        date_gte: str,
+        date_lte: str,
+        max_rows: int = NDL_SPLIT_THRESHOLD,
+    ) -> list[dict]:
+        """
+        Compute optimal fetch filter sets using set-cover solver.
+        Returns list of filter dicts that cover all gaps with minimal requests.
+        """
+        cached_cells = self._get_cached_cells(tickers, date_gte, date_lte)
+        gaps = find_gaps(tickers, date_gte, date_lte, cached_cells)
+
+        if not gaps:
+            return []
+
+        requests = solve_cover(gaps, max_rows)
+
+        # Convert Request objects to filter dicts
+        return [
+            {
+                'ticker': list(req.tickers) if len(req.tickers) > 1 else list(req.tickers)[0],
+                'date_gte': req.start,
+                'date_lte': req.end,
+            }
+            for req in requests
+        ]
 
     def fetch_from_ndl(self, **filters) -> pd.DataFrame:
         """
@@ -352,54 +393,28 @@ class CachedTable:
     def query(self, columns: list[str] | str | None = None, **filters) -> pd.DataFrame:
         """
         Query data, returning immutable and/or derived columns.
-        Fetches from NDL if not cached, using set intersection to avoid re-fetching.
+        Fetches from NDL if not cached, using set-cover solver to minimize API calls.
         """
-        # Get from cache
-        immutable = self.get_cached(**filters)
-
-        # Determine what's missing and fetch it
+        # Normalize ticker to list for consistent handling
         ticker_filter = filters.get('ticker')
-        if isinstance(ticker_filter, list):
-            # Multi-ticker query: prefer single overfetch call if under page limit
-            date_gte = filters.get('date_gte')
-            date_lte = filters.get('date_lte')
-
-            # Check if any ticker has gaps
-            has_gaps = False
-            for ticker in ticker_filter:
-                ticker_data = immutable[immutable['ticker'] == ticker] if len(immutable) > 0 else pd.DataFrame()
-                if self._compute_date_gaps(ticker_data, date_gte, date_lte):
-                    has_gaps = True
-                    break
-
-            if has_gaps:
-                est_rows = self._estimate_rows(filters)
-
-                if est_rows < NDL_SPLIT_THRESHOLD:
-                    # Single overfetch call for entire rectangle (may split if needed)
-                    self.sync(**filters)
-                else:
-                    # Large rectangle - collect only missing gaps to minimize data transfer
-                    all_gap_filters = []
-                    for ticker in ticker_filter:
-                        ticker_data = immutable[immutable['ticker'] == ticker] if len(immutable) > 0 else pd.DataFrame()
-                        ticker_filters = {**filters, 'ticker': ticker}
-                        gaps = self._compute_date_gaps(ticker_data, date_gte, date_lte)
-                        for gap_start, gap_end in gaps:
-                            all_gap_filters.append({**ticker_filters, 'date_gte': gap_start, 'date_lte': gap_end})
-
-                    if all_gap_filters:
-                        self._sync_parallel(all_gap_filters)
-
-                immutable = self.get_cached(**filters)
-        elif len(immutable) == 0:
-            # Cache empty: fetch everything
-            self.sync(**filters)
-            immutable = self.get_cached(**filters)
+        if isinstance(ticker_filter, str):
+            tickers = [ticker_filter]
+        elif isinstance(ticker_filter, list):
+            tickers = ticker_filter
         else:
-            # Check for date range gaps
-            if self._fill_date_gaps(immutable, filters):
-                immutable = self.get_cached(**filters)
+            tickers = []
+
+        date_gte = filters.get('date_gte')
+        date_lte = filters.get('date_lte')
+
+        # Use cover solver to compute optimal fetches for gaps
+        if tickers and date_gte and date_lte:
+            optimal_fetches = self._compute_optimal_fetches(tickers, date_gte, date_lte)
+            if optimal_fetches:
+                self._sync_parallel(optimal_fetches)
+
+        # Get final result from cache
+        immutable = self.get_cached(**filters)
 
         if len(immutable) == 0:
             return pd.DataFrame()

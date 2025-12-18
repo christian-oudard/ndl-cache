@@ -532,5 +532,257 @@
       "closeadj": 125.411,
       "closeunadj": 129.04
     }
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-31&date.lte=2020-09-04&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL,MSFT": [
+    {
+      "ticker": "MSFT",
+      "date": "2020-09-04T00:00:00.000",
+      "open": 215.1,
+      "low": 205.19,
+      "high": 218.36,
+      "close": 214.25,
+      "volume": 59664000.0,
+      "closeadj": 205.023,
+      "closeunadj": 214.25
+    },
+    {
+      "ticker": "MSFT",
+      "date": "2020-09-03T00:00:00.000",
+      "open": 229.27,
+      "low": 214.96,
+      "high": 229.31,
+      "close": 217.3,
+      "volume": 57646000.0,
+      "closeadj": 207.942,
+      "closeunadj": 217.3
+    },
+    {
+      "ticker": "MSFT",
+      "date": "2020-09-02T00:00:00.000",
+      "open": 227.97,
+      "low": 227.35,
+      "high": 232.86,
+      "close": 231.65,
+      "volume": 33919000.0,
+      "closeadj": 221.674,
+      "closeunadj": 231.65
+    },
+    {
+      "ticker": "MSFT",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 225.51,
+      "low": 224.43,
+      "high": 227.45,
+      "close": 227.27,
+      "volume": 24853000.0,
+      "closeadj": 217.482,
+      "closeunadj": 227.27
+    },
+    {
+      "ticker": "MSFT",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 227.0,
+      "low": 224.31,
+      "high": 228.7,
+      "close": 225.53,
+      "volume": 28531000.0,
+      "closeadj": 215.817,
+      "closeunadj": 225.53
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-04T00:00:00.000",
+      "open": 120.07,
+      "low": 110.89,
+      "high": 123.7,
+      "close": 120.96,
+      "volume": 332607000.0,
+      "closeadj": 117.558,
+      "closeunadj": 120.96
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-03T00:00:00.000",
+      "open": 126.91,
+      "low": 120.5,
+      "high": 128.84,
+      "close": 120.88,
+      "volume": 250624000.0,
+      "closeadj": 117.48,
+      "closeunadj": 120.88
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-02T00:00:00.000",
+      "open": 137.59,
+      "low": 127.0,
+      "high": 137.98,
+      "close": 131.4,
+      "volume": 198233000.0,
+      "closeadj": 127.705,
+      "closeunadj": 131.4
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 132.76,
+      "low": 130.53,
+      "high": 134.8,
+      "close": 134.18,
+      "volume": 150699000.0,
+      "closeadj": 130.406,
+      "closeunadj": 134.18
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 127.58,
+      "low": 126.0,
+      "high": 131.0,
+      "close": 129.04,
+      "volume": 223506000.0,
+      "closeadj": 125.411,
+      "closeunadj": 129.04
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-31&date.lte=2020-08-31&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL,MSFT": [
+    {
+      "ticker": "MSFT",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 227.0,
+      "low": 224.31,
+      "high": 228.7,
+      "close": 225.53,
+      "volume": 28531000.0,
+      "closeadj": 215.817,
+      "closeunadj": 225.53
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 127.58,
+      "low": 126.0,
+      "high": 131.0,
+      "close": 129.04,
+      "volume": 223506000.0,
+      "closeadj": 125.411,
+      "closeunadj": 129.04
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-31&date.lte=2020-09-01&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL,MSFT": [
+    {
+      "ticker": "MSFT",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 225.51,
+      "low": 224.43,
+      "high": 227.45,
+      "close": 227.27,
+      "volume": 24853000.0,
+      "closeadj": 217.482,
+      "closeunadj": 227.27
+    },
+    {
+      "ticker": "MSFT",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 227.0,
+      "low": 224.31,
+      "high": 228.7,
+      "close": 225.53,
+      "volume": 28531000.0,
+      "closeadj": 215.817,
+      "closeunadj": 225.53
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 132.76,
+      "low": 130.53,
+      "high": 134.8,
+      "close": 134.18,
+      "volume": 150699000.0,
+      "closeadj": 130.406,
+      "closeunadj": 134.18
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 127.58,
+      "low": 126.0,
+      "high": 131.0,
+      "close": 129.04,
+      "volume": 223506000.0,
+      "closeadj": 125.411,
+      "closeunadj": 129.04
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-08-31&date.lte=2020-09-01&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=MSFT,AAPL": [
+    {
+      "ticker": "MSFT",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 225.51,
+      "low": 224.43,
+      "high": 227.45,
+      "close": 227.27,
+      "volume": 24853000.0,
+      "closeadj": 217.482,
+      "closeunadj": 227.27
+    },
+    {
+      "ticker": "MSFT",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 227.0,
+      "low": 224.31,
+      "high": 228.7,
+      "close": 225.53,
+      "volume": 28531000.0,
+      "closeadj": 215.817,
+      "closeunadj": 225.53
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 132.76,
+      "low": 130.53,
+      "high": 134.8,
+      "close": 134.18,
+      "volume": 150699000.0,
+      "closeadj": 130.406,
+      "closeunadj": 134.18
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-08-31T00:00:00.000",
+      "open": 127.58,
+      "low": 126.0,
+      "high": 131.0,
+      "close": 129.04,
+      "volume": 223506000.0,
+      "closeadj": 125.411,
+      "closeunadj": 129.04
+    }
+  ],
+  "SHARADAR/SEP?date.gte=2020-09-01&date.lte=2020-09-01&qopts.columns=ticker,date,open,low,high,close,volume,closeadj,closeunadj&ticker=AAPL,MSFT": [
+    {
+      "ticker": "MSFT",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 225.51,
+      "low": 224.43,
+      "high": 227.45,
+      "close": 227.27,
+      "volume": 24853000.0,
+      "closeadj": 217.482,
+      "closeunadj": 227.27
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2020-09-01T00:00:00.000",
+      "open": 132.76,
+      "low": 130.53,
+      "high": 134.8,
+      "close": 134.18,
+      "volume": 150699000.0,
+      "closeadj": 130.406,
+      "closeunadj": 134.18
+    }
   ]
 }

@@ -399,7 +399,7 @@ class TestSetIntersection:
     def test_multi_ticker_no_double_query(self, sep, track_api_calls):
         """
         Query MSFT alone, then MSFT+AAPL together.
-        Second query uses overfetch strategy (re-fetches MSFT with AAPL).
+        Cover solver fetches only AAPL (MSFT already cached).
         """
         # First query: just MSFT
         df1 = sep.query(
@@ -422,14 +422,14 @@ class TestSetIntersection:
         assert len(df2) == 2
         assert set(df2['ticker'].tolist()) == {'MSFT', 'AAPL'}
 
-        # With overfetch strategy: one call for both tickers (re-fetches MSFT)
+        # Cover solver: only fetches AAPL (MSFT already in cache)
         assert len(track_api_calls) == 2, f"Expected 2 total API calls, got {len(track_api_calls)}"
 
-        # Second call fetches both tickers (overfetch is OK)
+        # Second call fetches only AAPL (efficient - no overfetch)
         second_call = track_api_calls[1]
         ticker_arg = second_call['kwargs'].get('ticker')
-        assert ticker_arg == ['MSFT', 'AAPL'], \
-            f"Second API call should request both tickers, got ticker={ticker_arg}"
+        assert ticker_arg == 'AAPL', \
+            f"Second API call should request only AAPL, got ticker={ticker_arg}"
 
     def test_date_range_no_double_query(self, sep, track_api_calls):
         """
@@ -553,7 +553,7 @@ class TestSetIntersection:
 
         # Verify overfetch call covers full rectangle
         overfetch_call = track_api_calls[2]
-        assert overfetch_call['kwargs'].get('ticker') == ['MSFT', 'AAPL']
+        assert set(overfetch_call['kwargs'].get('ticker')) == {'MSFT', 'AAPL'}
         date_filter = overfetch_call['kwargs'].get('date', {})
         assert date_filter.get('gte') == '2020-08-31'
         assert date_filter.get('lte') == '2020-09-04'
@@ -574,7 +574,7 @@ class TestSetIntersection:
         assert set(df1['ticker'].tolist()) == {'MSFT', 'AAPL'}
         # One batched call for both tickers
         assert len(track_api_calls) == 1
-        assert track_api_calls[0]['kwargs'].get('ticker') == ['MSFT', 'AAPL']
+        assert set(track_api_calls[0]['kwargs'].get('ticker')) == {'MSFT', 'AAPL'}
 
         # Second query: Both tickers Tuesday (2020-09-01)
         df2 = sep.query(
@@ -593,13 +593,12 @@ class TestSetIntersection:
         # Verify the second call includes both tickers
         second_call = track_api_calls[1]
         ticker_arg = second_call['kwargs'].get('ticker')
-        assert ticker_arg == ['MSFT', 'AAPL'], \
+        assert set(ticker_arg) == {'MSFT', 'AAPL'}, \
             f"Second call should request both tickers, got {ticker_arg}"
 
-    def test_overfetch_to_minimize_calls(self, sep, track_api_calls):
+    def test_cover_solver_batches_efficiently(self, sep, track_api_calls):
         """
-        When tickers have different gaps, prefer one overfetching call
-        over multiple exact-coverage calls.
+        Cover solver batches tickers efficiently, fetching only missing gaps.
 
         Cache state:
           MSFT: has Mon, Wed (missing Tue)
@@ -607,8 +606,8 @@ class TestSetIntersection:
 
         Query: both tickers Mon-Wed
 
-        Old behavior: 2 calls (MSFT×Tue, AAPL×Mon-Tue)
-        New behavior: 1 call (both×Mon-Wed) with overfetch
+        Cover solver finds optimal solution: one call for both tickers Mon-Tue
+        (doesn't overfetch Wed since both already have it cached)
         """
         # Setup: Cache MSFT for Mon and Wed
         sep.query(columns=['close'], ticker='MSFT', date_gte='2020-08-31', date_lte='2020-08-31')
@@ -630,17 +629,17 @@ class TestSetIntersection:
         # Should have all 6 rows (2 tickers × 3 days)
         assert len(df) == 6, f"Expected 6 rows, got {len(df)}"
 
-        # Should make only 1 additional call (overfetching full rectangle)
-        # NOT 2 calls (one for MSFT×Tue, one for AAPL×Mon-Tue)
+        # Cover solver makes only 1 additional call (batched for gaps only)
         assert len(track_api_calls) == 4, \
-            f"Expected 4 total calls (3 setup + 1 overfetch), got {len(track_api_calls)}"
+            f"Expected 4 total calls (3 setup + 1 gap-fill), got {len(track_api_calls)}"
 
-        # The overfetch call should request both tickers for full date range
-        overfetch_call = track_api_calls[3]
-        assert overfetch_call['kwargs'].get('ticker') == ['MSFT', 'AAPL']
-        date_filter = overfetch_call['kwargs'].get('date', {})
+        # The gap-fill call requests both tickers for Mon-Tue (not Wed, already cached)
+        gap_fill_call = track_api_calls[3]
+        ticker_arg = gap_fill_call['kwargs'].get('ticker')
+        assert set(ticker_arg) == {'MSFT', 'AAPL'}, f"Expected both tickers, got {ticker_arg}"
+        date_filter = gap_fill_call['kwargs'].get('date', {})
         assert date_filter.get('gte') == '2020-08-31'
-        assert date_filter.get('lte') == '2020-09-02'
+        assert date_filter.get('lte') == '2020-09-01'  # Mon-Tue, not Wed
 
 
 class TestFilterSplitting:
