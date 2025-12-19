@@ -53,13 +53,15 @@ class CachedTable:
             CREATE TABLE IF NOT EXISTS {self._sync_bounds_table_name()} (
                 ticker VARCHAR PRIMARY KEY,
                 synced_from DATE,
-                synced_to DATE
+                synced_to DATE,
+                max_lastupdated DATE,
+                last_staleness_check DATE
             )
         """)
 
-    def _ensure_data_table(self, immutable_columns: list[str]):
+    def _ensure_data_table(self, data_columns: list[str]):
         """Create data table if it doesn't exist, with given columns."""
-        cols = self.index_columns + immutable_columns
+        cols = self.index_columns + data_columns
         col_defs = [f'{col} {self.column_types.get(col, "DOUBLE")}' for col in cols]
         pk = ', '.join(self.index_columns)
 
@@ -76,64 +78,150 @@ class CachedTable:
     def _sync_bounds_table_name(self) -> str:
         return f"{self._safe_table_name()}_sync_bounds"
 
-    def _get_sync_bounds(self, tickers: list[str]) -> dict[str, tuple[str, str] | None]:
+    def _get_sync_bounds(self, tickers: list[str]) -> dict[str, dict | None]:
         """
         Get sync bounds for given tickers.
-        Returns dict mapping ticker -> (synced_from, synced_to) or None if not synced.
+        Returns dict mapping ticker -> {synced_from, synced_to, max_lastupdated, last_staleness_check} or None if not synced.
         """
         if not tickers:
             return {}
 
         placeholders = ', '.join(['?'] * len(tickers))
         result = self.conn.execute(f"""
-            SELECT ticker, synced_from, synced_to
+            SELECT ticker, synced_from, synced_to, max_lastupdated, last_staleness_check
             FROM {self._sync_bounds_table_name()}
             WHERE ticker IN ({placeholders})
         """, tickers).fetchall()
 
         bounds = {ticker: None for ticker in tickers}
-        for ticker, synced_from, synced_to in result:
-            bounds[ticker] = (str(synced_from)[:10], str(synced_to)[:10])
+        for ticker, synced_from, synced_to, max_lastupdated, last_staleness_check in result:
+            bounds[ticker] = {
+                'synced_from': str(synced_from)[:10] if synced_from else None,
+                'synced_to': str(synced_to)[:10] if synced_to else None,
+                'max_lastupdated': str(max_lastupdated)[:10] if max_lastupdated else None,
+                'last_staleness_check': str(last_staleness_check)[:10] if last_staleness_check else None,
+            }
 
         return bounds
 
-    def _update_sync_bounds(self, ticker: str, from_date: str, to_date: str):
+    def _update_sync_bounds(self, ticker: str, from_date: str, to_date: str, max_lastupdated: str | None = None):
         """
         Update sync bounds for a ticker, expanding the existing range.
         Caps to_date to account for Sharadar's data delay.
+        Also updates max_lastupdated if provided.
         """
         effective_to = _effective_sync_date(to_date)
 
         # Get existing bounds
         existing = self.conn.execute(f"""
-            SELECT synced_from, synced_to
+            SELECT synced_from, synced_to, max_lastupdated
             FROM {self._sync_bounds_table_name()}
             WHERE ticker = ?
         """, [ticker]).fetchone()
 
         if existing:
             old_from, old_to = str(existing[0])[:10], str(existing[1])[:10]
+            old_max_lastupdated = str(existing[2])[:10] if existing[2] else None
             new_from = min(from_date, old_from)
             new_to = max(effective_to, old_to)
+            # Update max_lastupdated if new one is greater
+            if max_lastupdated and (not old_max_lastupdated or max_lastupdated > old_max_lastupdated):
+                new_max_lastupdated = max_lastupdated
+            else:
+                new_max_lastupdated = old_max_lastupdated
         else:
             new_from = from_date
             new_to = effective_to
+            new_max_lastupdated = max_lastupdated
 
+        # Set last_staleness_check to today when syncing (we just got fresh data)
+        today = datetime.now().strftime('%Y-%m-%d')
         self.conn.execute(f"""
             INSERT OR REPLACE INTO {self._sync_bounds_table_name()}
-            (ticker, synced_from, synced_to)
-            VALUES (?, ?, ?)
-        """, [ticker, new_from, new_to])
+            (ticker, synced_from, synced_to, max_lastupdated, last_staleness_check)
+            VALUES (?, ?, ?, ?, ?)
+        """, [ticker, new_from, new_to, new_max_lastupdated, today])
 
-    @staticmethod
-    def immutable_data(queried: pd.DataFrame) -> pd.DataFrame:
-        """Convert queried data to immutable storage format. Override in subclass."""
-        raise NotImplementedError
+    def _check_and_invalidate_stale(self, tickers: list[str]):
+        """
+        Check if cached data is stale and invalidate if needed.
+        Only checks once per day per ticker to minimize API calls.
 
-    @staticmethod
-    def derived_data(immutable: pd.DataFrame) -> pd.DataFrame:
-        """Derive output columns from immutable data. Override in subclass."""
-        raise NotImplementedError
+        Staleness is detected by comparing cached max_lastupdated with
+        the current lastupdated from the API.
+        """
+        if not tickers:
+            return
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        sync_bounds = self._get_sync_bounds(tickers)
+
+        # Find tickers that need staleness check (not checked today and have cached data)
+        tickers_to_check = []
+        for ticker in tickers:
+            bounds = sync_bounds.get(ticker)
+            if bounds is None:
+                continue  # Not cached yet, will be fetched fresh
+            last_check = bounds.get('last_staleness_check')
+            if last_check == today:
+                continue  # Already checked today
+            tickers_to_check.append(ticker)
+
+        if not tickers_to_check:
+            return
+
+        # Query API for one recent row per ticker to get current lastupdated
+        # Use a recent date range to ensure we get data
+        stale_tickers = []
+        for ticker in tickers_to_check:
+            try:
+                # Get one row to check lastupdated
+                row = ndl.get_table(
+                    self.table_name,
+                    ticker=ticker,
+                    qopts={'columns': ['lastupdated']},
+                    paginate=False
+                )
+                if len(row) > 0 and 'lastupdated' in row.columns:
+                    api_lastupdated = str(row['lastupdated'].max())[:10]
+                    cached_lastupdated = sync_bounds[ticker].get('max_lastupdated')
+
+                    if cached_lastupdated and api_lastupdated > cached_lastupdated:
+                        stale_tickers.append(ticker)
+
+                # Update last_staleness_check regardless of staleness
+                self.conn.execute(f"""
+                    UPDATE {self._sync_bounds_table_name()}
+                    SET last_staleness_check = ?
+                    WHERE ticker = ?
+                """, [today, ticker])
+            except Exception:
+                # If API check fails, skip this ticker
+                pass
+
+        # Invalidate stale tickers by deleting their cached data and sync bounds
+        for ticker in stale_tickers:
+            self._invalidate_ticker(ticker)
+
+    def _invalidate_ticker(self, ticker: str):
+        """Delete all cached data and sync bounds for a ticker."""
+        # Delete from data table
+        table_exists = self.conn.execute(f"""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_name = '{self._safe_table_name()}'
+        """).fetchone()[0] > 0
+
+        if table_exists:
+            self.conn.execute(f"""
+                DELETE FROM {self._safe_table_name()}
+                WHERE ticker = ?
+            """, [ticker])
+
+        # Delete from sync bounds
+        self.conn.execute(f"""
+            DELETE FROM {self._sync_bounds_table_name()}
+            WHERE ticker = ?
+        """, [ticker])
 
     def _estimate_rows_for_range(self, date_gte: str | None, date_lte: str | None) -> int:
         """Estimate number of rows per ticker for a date range."""
@@ -218,7 +306,14 @@ class CachedTable:
         Compute optimal fetch filter sets using set-cover solver.
         Returns list of filter dicts that cover all gaps with minimal requests.
         """
-        sync_bounds = self._get_sync_bounds(tickers)
+        sync_bounds_raw = self._get_sync_bounds(tickers)
+        # Convert to format expected by find_gaps: ticker -> (synced_from, synced_to) or None
+        sync_bounds = {}
+        for ticker, bounds in sync_bounds_raw.items():
+            if bounds is None:
+                sync_bounds[ticker] = None
+            else:
+                sync_bounds[ticker] = (bounds['synced_from'], bounds['synced_to'])
         gaps = find_gaps(tickers, date_gte, date_lte, sync_bounds)
 
         if not gaps:
@@ -328,42 +423,47 @@ class CachedTable:
 
         queried = self._fetch_parallel(filter_sets)
 
+        # Extract max_lastupdated per ticker from queried data
+        max_lastupdated_by_ticker = {}
+        if len(queried) > 0 and 'lastupdated' in queried.columns:
+            for ticker in queried['ticker'].unique():
+                ticker_data = queried[queried['ticker'] == ticker]
+                max_lu = ticker_data['lastupdated'].max()
+                if pd.notna(max_lu):
+                    max_lastupdated_by_ticker[ticker] = str(max_lu)[:10]
+
         # Update sync bounds for all tickers in the filter sets
         # (even if we got no data - we still queried that range)
         date_col = self.date_column
+        today = datetime.now().strftime('%Y-%m-%d')
         for filters in filter_sets:
             ticker = filters.get('ticker')
-            date_gte = filters.get(f'{date_col}_gte')
-            date_lte = filters.get(f'{date_col}_lte')
-            if ticker and date_gte and date_lte:
+            date_gte = filters.get(f'{date_col}_gte', '1900-01-01')  # Full history if no filter
+            date_lte = filters.get(f'{date_col}_lte', today)
+            if ticker:
                 tickers = ticker if isinstance(ticker, list) else [ticker]
                 for t in tickers:
-                    self._update_sync_bounds(t, date_gte, date_lte)
+                    self._update_sync_bounds(t, date_gte, date_lte, max_lastupdated_by_ticker.get(t))
 
         if len(queried) == 0:
             return 0
 
-        immutable = self.immutable_data(queried)
-        immutable_columns = list(immutable.columns)
-
-        # Add index columns
-        for col in self.index_columns:
-            immutable[col] = queried[col]
+        # Store data columns (everything except index columns)
+        data_columns = [c for c in self.query_columns if c in queried.columns]
 
         # Ensure table exists with correct schema
-        self._ensure_data_table(immutable_columns)
+        self._ensure_data_table(data_columns)
 
-        # Reorder columns to match table schema
-        col_order = self.index_columns + immutable_columns
-        immutable = immutable[col_order]
+        # Build DataFrame for storage
+        store_df = queried[self.index_columns + data_columns].copy()
 
         # Upsert into DuckDB
         self.conn.execute(f"""
             INSERT OR REPLACE INTO {self._safe_table_name()}
-            SELECT * FROM immutable
+            SELECT * FROM store_df
         """)
 
-        return len(immutable)
+        return len(store_df)
 
     def sync(self, **filters):
         """Sync data from NDL to local cache. Splits large requests automatically."""
@@ -391,6 +491,15 @@ class CachedTable:
 
         where = ' AND '.join(where_clauses) if where_clauses else '1=1'
 
+        # Check if table exists
+        table_exists = self.conn.execute(f"""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_name = '{self._safe_table_name()}'
+        """).fetchone()[0] > 0
+
+        if not table_exists:
+            return pd.DataFrame()
+
         df = self.conn.execute(f"""
             SELECT * FROM {self._safe_table_name()}
             WHERE {where}
@@ -398,14 +507,19 @@ class CachedTable:
         """, params).df()
 
         if len(df) > 0:
+            # Convert DATE columns to datetime before indexing
+            for col in self.index_columns:
+                if self.column_types.get(col) == 'DATE':
+                    df[col] = pd.to_datetime(df[col])
             df = df.set_index(self.index_columns)
 
         return df
 
     def query(self, columns: list[str] | str | None = None, **filters) -> pd.DataFrame:
         """
-        Query data, returning immutable and/or derived columns.
-        Fetches from NDL if not cached, using set-cover solver to minimize API calls.
+        Query data from cache, fetching from NDL if not cached.
+        Uses set-cover solver to minimize API calls.
+        Checks for stale data once per day per ticker.
 
         Returns DataFrame indexed by index_columns with requested data columns.
         """
@@ -422,30 +536,34 @@ class CachedTable:
         date_gte = filters.get(f'{self.date_column}_gte')
         date_lte = filters.get(f'{self.date_column}_lte')
 
-        # Use cover solver to compute optimal fetches for gaps
+        # Check for stale data and invalidate if needed (once per day per ticker)
+        if tickers:
+            self._check_and_invalidate_stale(tickers)
+
+        # Sync data from NDL if needed
         if tickers and date_gte and date_lte:
+            # Use cover solver to compute optimal fetches for gaps
             optimal_fetches = self._compute_optimal_fetches(tickers, date_gte, date_lte)
             if optimal_fetches:
                 self._sync_parallel(optimal_fetches)
+        elif tickers and not date_gte and not date_lte:
+            # No date filters - sync full history for unsynced tickers
+            sync_bounds = self._get_sync_bounds(tickers)
+            unsynced = [t for t in tickers if sync_bounds.get(t) is None]
+            if unsynced:
+                self._sync_parallel([{'ticker': t} for t in unsynced])
 
         # Get final result from cache (already indexed by index_columns)
-        immutable = self.get_cached(**filters)
+        result = self.get_cached(**filters)
 
-        if len(immutable) == 0:
+        if len(result) == 0:
             return pd.DataFrame()
 
-        # Derive computed columns (returns DataFrame with same index)
-        derived = self.derived_data(immutable)
-
         # Select requested columns (or all if None)
-        if columns is None:
-            # Return all: immutable + derived
-            result = pd.concat([immutable, derived], axis=1)
-        else:
+        if columns is not None:
             if isinstance(columns, str):
                 columns = [columns]
-            all_data = pd.concat([immutable, derived], axis=1)
-            result = all_data[[c for c in columns if c in all_data.columns]]
+            result = result[[c for c in columns if c in result.columns]]
 
         return result
 
