@@ -24,6 +24,9 @@ TRADING_DAYS_PER_YEAR = 252
 # Sharadar data delay - don't mark recent dates as synced since data may still appear
 SHARADAR_DELAY_DAYS = 3
 
+# Default database path
+DB_PATH = 'cache.duckdb'
+
 
 def _effective_sync_date(date_str: str) -> str:
     """Cap a date to account for Sharadar's data delay."""
@@ -36,50 +39,34 @@ class CachedTable:
     table_name: str
     index_columns: list[str]
     query_columns: list[str]
-    immutable_columns: list[str]
     date_column: str = 'date'  # Column used for date-based filtering and sync bounds
-    column_types: dict[str, str] = {}  # Override column types (defaults: ticker=VARCHAR, date-like=DATE, rest=DOUBLE)
+    column_types: dict[str, str] = {}  # Override column types (default: DOUBLE)
     rows_per_year: int = TRADING_DAYS_PER_YEAR  # Expected rows per ticker per year (for request size estimation)
 
-    def __init__(self, db_path: str = 'cache.duckdb'):
-        self.db_path = Path(db_path)
-        self.conn = duckdb.connect(str(self.db_path))
-        self._ensure_table()
+    def __init__(self):
+        self.conn = duckdb.connect(DB_PATH)
+        self._ensure_sync_bounds_table()
 
-    def _get_column_type(self, col: str) -> str:
-        """Determine SQL type for a column."""
-        # Check explicit override first
-        if col in self.column_types:
-            return self.column_types[col]
-        # Defaults based on naming
-        if col == 'ticker':
-            return 'VARCHAR'
-        if col == 'date' or col.endswith('date') or col in ('datekey', 'reportperiod', 'lastupdated'):
-            return 'DATE'
-        if col == 'dimension':
-            return 'VARCHAR'
-        return 'DOUBLE'
-
-    def _ensure_table(self):
-        """Create data table and sync_bounds table if they don't exist."""
-        # Data table
-        cols = self.index_columns + self.immutable_columns
-        col_defs = [f'{col} {self._get_column_type(col)}' for col in cols]
-
-        pk = ', '.join(self.index_columns)
-        self.conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {self._safe_table_name()} (
-                {', '.join(col_defs)},
-                PRIMARY KEY ({pk})
-            )
-        """)
-
-        # Sync bounds table
+    def _ensure_sync_bounds_table(self):
+        """Create sync_bounds table if it doesn't exist."""
         self.conn.execute(f"""
             CREATE TABLE IF NOT EXISTS {self._sync_bounds_table_name()} (
                 ticker VARCHAR PRIMARY KEY,
                 synced_from DATE,
                 synced_to DATE
+            )
+        """)
+
+    def _ensure_data_table(self, immutable_columns: list[str]):
+        """Create data table if it doesn't exist, with given columns."""
+        cols = self.index_columns + immutable_columns
+        col_defs = [f'{col} {self.column_types.get(col, "DOUBLE")}' for col in cols]
+        pk = ', '.join(self.index_columns)
+
+        self.conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self._safe_table_name()} (
+                {', '.join(col_defs)},
+                PRIMARY KEY ({pk})
             )
         """)
 
@@ -357,13 +344,17 @@ class CachedTable:
             return 0
 
         immutable = self.immutable_data(queried)
+        immutable_columns = list(immutable.columns)
 
         # Add index columns
         for col in self.index_columns:
             immutable[col] = queried[col]
 
+        # Ensure table exists with correct schema
+        self._ensure_data_table(immutable_columns)
+
         # Reorder columns to match table schema
-        col_order = self.index_columns + self.immutable_columns
+        col_order = self.index_columns + immutable_columns
         immutable = immutable[col_order]
 
         # Upsert into DuckDB
@@ -380,7 +371,7 @@ class CachedTable:
         return self._sync_parallel([filters])
 
     def get_cached(self, **filters) -> pd.DataFrame:
-        """Get data from local cache."""
+        """Get data from local cache, indexed by index_columns."""
         where_clauses = []
         params = []
         for key, value in filters.items():
@@ -400,15 +391,23 @@ class CachedTable:
 
         where = ' AND '.join(where_clauses) if where_clauses else '1=1'
 
-        return self.conn.execute(f"""
+        df = self.conn.execute(f"""
             SELECT * FROM {self._safe_table_name()}
             WHERE {where}
+            ORDER BY {', '.join(self.index_columns)}
         """, params).df()
+
+        if len(df) > 0:
+            df = df.set_index(self.index_columns)
+
+        return df
 
     def query(self, columns: list[str] | str | None = None, **filters) -> pd.DataFrame:
         """
         Query data, returning immutable and/or derived columns.
         Fetches from NDL if not cached, using set-cover solver to minimize API calls.
+
+        Returns DataFrame indexed by index_columns with requested data columns.
         """
         # Normalize ticker to list for consistent handling
         ticker_filter = filters.get('ticker')
@@ -429,36 +428,25 @@ class CachedTable:
             if optimal_fetches:
                 self._sync_parallel(optimal_fetches)
 
-        # Get final result from cache
+        # Get final result from cache (already indexed by index_columns)
         immutable = self.get_cached(**filters)
 
         if len(immutable) == 0:
             return pd.DataFrame()
 
-        # Derive computed columns
+        # Derive computed columns (returns DataFrame with same index)
         derived = self.derived_data(immutable)
-
-        # Build result from index + immutable + derived
-        result = pd.DataFrame()
-        for col in self.index_columns:
-            result[col] = immutable[col]
 
         # Select requested columns (or all if None)
         if columns is None:
             # Return all: immutable + derived
-            for col in self.immutable_columns:
-                result[col] = immutable[col]
-            for col in derived.columns:
-                result[col] = derived[col]
+            result = pd.concat([immutable, derived], axis=1)
         else:
             if isinstance(columns, str):
                 columns = [columns]
-            for col in columns:
-                if col in immutable.columns:
-                    result[col] = immutable[col]
-                elif col in derived.columns:
-                    result[col] = derived[col]
+            all_data = pd.concat([immutable, derived], axis=1)
+            result = all_data[[c for c in columns if c in all_data.columns]]
 
-        return result.sort_values(self.index_columns).reset_index(drop=True)
+        return result
 
 

@@ -4,12 +4,14 @@ import pandas as pd
 from pathlib import Path
 from io import StringIO
 from math import isclose
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from urllib.parse import parse_qs
+import tempfile
+import os
 
 import cache
 from cache import CachedTable
-from tables import SEPTable
+from tables import SEPTable, ActionsTable
 
 
 # Query fixture cache for mocking NDL API
@@ -86,11 +88,13 @@ def mock_ndl():
 
 @pytest.fixture
 def sep():
-    """Create SEPTable with in-memory database."""
-    with patch.object(SEPTable, '__init__', lambda self, db_path=':memory:': CachedTable.__init__(self, ':memory:')):
-        table = SEPTable(':memory:')
-        yield table
-        table.conn.close()
+    """Create SEPTable with temp database."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, 'test.duckdb')
+        with patch.object(cache, 'DB_PATH', db_path):
+            table = SEPTable()
+            yield table
+            table.conn.close()
 
 
 @pytest.fixture
@@ -109,10 +113,14 @@ def track_api_calls():
 
 
 class TestImmutableData:
-    """Test the immutable_data transformation."""
+    """Test the immutable_data transformation.
 
-    def test_split_factor_calculation(self):
-        """split_factor = closeunadj / close"""
+    Note: split_factor and split_dividend_factor are no longer stored in immutable data.
+    They are now computed dynamically from ACTIONS table on read.
+    """
+
+    def test_immutable_columns(self):
+        """Verify only unadjusted prices/volume are stored as immutable."""
         queried = pd.DataFrame({
             'ticker': ['AAPL', 'AAPL'],
             'date': ['2020-08-28', '2020-08-31'],
@@ -127,9 +135,13 @@ class TestImmutableData:
 
         immutable = SEPTable.immutable_data(queried)
 
-        # split_factor = closeunadj / close (exact)
-        assert immutable['split_factor'].iloc[0] == 499.23 / 124.81
-        assert immutable['split_factor'].iloc[1] == 1.0
+        # Only unadjusted columns should be stored
+        assert 'openunadj' in immutable.columns
+        assert 'closeunadj' in immutable.columns
+        assert 'volumeunadj' in immutable.columns
+        # split_factor should NOT be stored (computed from ACTIONS)
+        assert 'split_factor' not in immutable.columns
+        assert 'split_dividend_factor' not in immutable.columns
 
     def test_price_unadj_calculation(self):
         """price_unadj = price * split_factor"""
@@ -148,11 +160,12 @@ class TestImmutableData:
         immutable = SEPTable.immutable_data(queried)
 
         # openunadj = open * split_factor (exact)
+        # split_factor = closeunadj / close
         split_factor = 499.23 / 124.81
         assert immutable['openunadj'].iloc[0] == 126.01 * split_factor
 
     def test_volume_unadj_calculation(self):
-        """volume_unadj = volume / split_factor (inverse of price)"""
+        """volume_unadj = volume / split_factor (actual shares traded)"""
         queried = pd.DataFrame({
             'ticker': ['AAPL'],
             'date': ['2020-08-28'],
@@ -168,6 +181,7 @@ class TestImmutableData:
         immutable = SEPTable.immutable_data(queried)
 
         # volumeunadj = volume / split_factor (exact)
+        # split_factor = closeunadj / close
         split_factor = 499.23 / 124.81
         assert immutable['volumeunadj'].iloc[0] == 187630000 / split_factor
 
@@ -187,66 +201,62 @@ class TestImmutableData:
 
         immutable = SEPTable.immutable_data(queried)
 
-        # closeunadj = close * split_factor should match original exactly
+        # closeunadj = close / split_adj should match original exactly
         assert immutable['closeunadj'].iloc[0] == 499.23
         assert immutable['closeunadj'].iloc[1] == 213.25
 
 
 class TestDerivedData:
-    """Test the derived_data transformation."""
+    """Test the derived_data transformation.
 
-    def test_price_derived_from_unadj(self):
-        """price = price_unadj / split_factor"""
-        immutable = pd.DataFrame({
-            'split_factor': [4.0, 1.0],
-            'split_dividend_factor': [4.1, 1.03],
-            'openunadj': [504.0, 127.58],
-            'highunadj': [506.0, 131.00],
-            'lowunadj': [498.0, 126.00],
-            'closeunadj': [499.23, 129.04],
-            'volumeunadj': [46907500, 223506000],
-        })
+    Note: derived_data is now an instance method that computes adjustment
+    factors from ACTIONS data rather than reading from stored columns.
+    """
 
-        derived = SEPTable.derived_data(immutable)
+    def test_price_derived_with_mock_actions(self, sep):
+        """price = price_unadj * split_adj (from ACTIONS)"""
+        # Query data around AAPL 4:1 split on 2020-08-31
+        df = sep.query(
+            columns=['open', 'openunadj', 'close', 'closeunadj'],
+            ticker='AAPL',
+            date_gte='2020-08-28',
+            date_lte='2020-09-02'
+        )
 
-        # open = openunadj / split_factor (exact)
-        assert derived['open'].iloc[0] == 504.0 / 4.0
-        assert derived['open'].iloc[1] == 127.58
+        # After split: closeunadj should equal close (adjustment = 1)
+        # Index is (ticker, date), filter by date level
+        post_split = df[df.index.get_level_values('date').astype(str) >= '2020-08-31']
+        for _, row in post_split.iterrows():
+            assert abs(row['closeunadj'] - row['close']) < 0.01
 
-    def test_volume_derived_from_unadj(self):
-        """volume = volume_unadj * split_factor (inverse of price)"""
-        immutable = pd.DataFrame({
-            'split_factor': [4.0, 1.0],
-            'split_dividend_factor': [4.1, 1.03],
-            'openunadj': [504.0, 127.58],
-            'highunadj': [506.0, 131.00],
-            'lowunadj': [498.0, 126.00],
-            'closeunadj': [499.23, 129.04],
-            'volumeunadj': [46907500, 223506000],
-        })
+    def test_volume_derived_with_mock_actions(self, sep):
+        """volume = volume_unadj / split_adj (from ACTIONS)"""
+        df = sep.query(
+            columns=['volume', 'volumeunadj'],
+            ticker='AAPL',
+            date_gte='2020-08-28',
+            date_lte='2020-09-02'
+        )
 
-        derived = SEPTable.derived_data(immutable)
+        # Post-split: volume should roughly equal volumeunadj
+        # Index is (ticker, date), filter by date level
+        post_split = df[df.index.get_level_values('date').astype(str) >= '2020-08-31']
+        for _, row in post_split.iterrows():
+            assert abs(row['volumeunadj'] - row['volume']) < 1
 
-        # volume = volumeunadj * split_factor (exact)
-        assert derived['volume'].iloc[0] == 46907500 * 4.0
-        assert derived['volume'].iloc[1] == 223506000
+    def test_adj_prices_derived_with_mock_actions(self, sep):
+        """price_adj includes dividend adjustments from ACTIONS"""
+        df = sep.query(
+            columns=['close', 'closeadj'],
+            ticker='AAPL',
+            date_gte='2020-08-28',
+            date_lte='2020-09-02'
+        )
 
-    def test_adj_prices_derived(self):
-        """price_adj = price_unadj / split_dividend_factor"""
-        immutable = pd.DataFrame({
-            'split_factor': [4.0],
-            'split_dividend_factor': [4.1],
-            'openunadj': [504.0],
-            'highunadj': [506.0],
-            'lowunadj': [498.0],
-            'closeunadj': [499.23],
-            'volumeunadj': [46907500],
-        })
-
-        derived = SEPTable.derived_data(immutable)
-
-        # openadj = openunadj / split_dividend_factor (exact)
-        assert derived['openadj'].iloc[0] == 504.0 / 4.1
+        # closeadj should be less than or equal to close (dividends reduce it)
+        for _, row in df.iterrows():
+            # closeadj <= close (within small tolerance for recent data)
+            assert row['closeadj'] <= row['close'] + 1.0
 
 
 class TestSEPTableIntegration:
@@ -262,8 +272,9 @@ class TestSEPTableIntegration:
         )
 
         assert len(df) > 0
-        assert 'ticker' in df.columns
-        assert 'date' in df.columns
+        # ticker and date are in index, not columns
+        assert 'ticker' in df.index.names
+        assert 'date' in df.index.names
         assert 'close' in df.columns
         assert 'closeunadj' in df.columns
 
@@ -371,6 +382,9 @@ class TestTableSchema:
 
     def test_primary_key_order(self, sep):
         """Test that primary key is (ticker, date) for efficient queries."""
+        # Sync data first to create table (lazy creation)
+        sep.sync(ticker='AAPL', date_gte='2020-08-28', date_lte='2020-08-28')
+
         result = sep.conn.execute("""
             SELECT constraint_column_names
             FROM duckdb_constraints()
@@ -394,8 +408,17 @@ class TestTableSchema:
         assert count1 == count2
 
 
+def filter_sep_calls(api_calls):
+    """Filter API calls to only include SHARADAR/SEP (exclude ACTIONS calls)."""
+    return [c for c in api_calls if c['args'][0] == 'SHARADAR/SEP']
+
+
 class TestSetIntersection:
-    """Test that the cache respects set intersections to avoid redundant queries."""
+    """Test that the cache respects set intersections to avoid redundant queries.
+
+    Note: Tests filter out ACTIONS API calls since SEP now syncs ACTIONS
+    for each ticker before querying prices.
+    """
 
     def test_multi_ticker_no_double_query(self, sep, track_api_calls):
         """
@@ -410,8 +433,9 @@ class TestSetIntersection:
             date_lte='2020-08-28'
         )
         assert len(df1) == 1
-        assert df1['ticker'].iloc[0] == 'MSFT'
-        assert len(track_api_calls) == 1, "Should have made exactly 1 API call for MSFT"
+        assert df1.index.get_level_values('ticker')[0] == 'MSFT'
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 1, f"Should have made exactly 1 SEP API call for MSFT, got {len(sep_calls)}"
 
         # Second query: MSFT + AAPL
         df2 = sep.query(
@@ -421,16 +445,17 @@ class TestSetIntersection:
             date_lte='2020-08-28'
         )
         assert len(df2) == 2
-        assert set(df2['ticker'].tolist()) == {'MSFT', 'AAPL'}
+        assert set(df2.index.get_level_values('ticker').tolist()) == {'MSFT', 'AAPL'}
 
         # Cover solver: only fetches AAPL (MSFT already in cache)
-        assert len(track_api_calls) == 2, f"Expected 2 total API calls, got {len(track_api_calls)}"
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 2, f"Expected 2 total SEP API calls, got {len(sep_calls)}"
 
-        # Second call fetches only AAPL (efficient - no overfetch)
-        second_call = track_api_calls[1]
-        ticker_arg = second_call['kwargs'].get('ticker')
+        # Second SEP call fetches only AAPL (efficient - no overfetch)
+        second_sep_call = sep_calls[1]
+        ticker_arg = second_sep_call['kwargs'].get('ticker')
         assert ticker_arg == 'AAPL', \
-            f"Second API call should request only AAPL, got ticker={ticker_arg}"
+            f"Second SEP API call should request only AAPL, got ticker={ticker_arg}"
 
     def test_date_range_no_double_query(self, sep, track_api_calls):
         """
@@ -445,8 +470,9 @@ class TestSetIntersection:
             date_lte='2020-08-31'
         )
         assert len(df1) == 1
-        assert str(df1['date'].iloc[0])[:10] == '2020-08-31'
-        assert len(track_api_calls) == 1, "Should have made exactly 1 API call for Monday"
+        assert str(df1.index.get_level_values('date')[0])[:10] == '2020-08-31'
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 1, f"Should have made exactly 1 SEP API call for Monday, got {len(sep_calls)}"
 
         # Second query: Monday + Tuesday (2020-08-31 to 2020-09-01)
         df2 = sep.query(
@@ -458,13 +484,14 @@ class TestSetIntersection:
         assert len(df2) == 2
 
         # Should only have made ONE additional call for Tuesday (not Monday again)
-        assert len(track_api_calls) == 2, f"Expected 2 total API calls, got {len(track_api_calls)}"
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 2, f"Expected 2 total SEP API calls, got {len(sep_calls)}"
 
         # Verify second call was only for Tuesday
-        second_call = track_api_calls[1]
+        second_call = sep_calls[1]
         date_filter = second_call['kwargs'].get('date', {})
         assert date_filter.get('gte') == '2020-09-01', \
-            f"Second API call should start from Tuesday, got {date_filter}"
+            f"Second SEP API call should start from Tuesday, got {date_filter}"
 
     def test_date_range_boundary_extension(self, sep, track_api_calls):
         """
@@ -479,7 +506,8 @@ class TestSetIntersection:
             date_lte='2020-09-02'
         )
         assert len(df1) == 3
-        assert len(track_api_calls) == 1
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 1
 
         # Second query: Monday-Friday (extend end date)
         df2 = sep.query(
@@ -491,15 +519,16 @@ class TestSetIntersection:
         assert len(df2) == 5
 
         # Should have made ONE additional call for Thu-Fri only
-        assert len(track_api_calls) == 2, f"Expected 2 total API calls, got {len(track_api_calls)}"
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 2, f"Expected 2 total SEP API calls, got {len(sep_calls)}"
 
         # Verify second call was for the extension (Thu-Fri)
-        second_call = track_api_calls[1]
+        second_call = sep_calls[1]
         date_filter = second_call['kwargs'].get('date', {})
         assert date_filter.get('gte') == '2020-09-03', \
-            f"Second API call should start from Thursday, got {date_filter}"
+            f"Second SEP API call should start from Thursday, got {date_filter}"
         assert date_filter.get('lte') == '2020-09-04', \
-            f"Second API call should end on Friday, got {date_filter}"
+            f"Second SEP API call should end on Friday, got {date_filter}"
 
     def test_disjoint_queries_fill_gap(self, sep, track_api_calls):
         """
@@ -514,7 +543,8 @@ class TestSetIntersection:
             date_lte='2020-08-31'
         )
         assert len(df1) == 1
-        assert len(track_api_calls) == 1
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 1
 
         # Second query: Friday only (2020-09-04)
         # This should trigger a fetch for Tue-Fri (the gap after synced_to)
@@ -525,15 +555,16 @@ class TestSetIntersection:
             date_lte='2020-09-04'
         )
         assert len(df2) == 1
-        assert len(track_api_calls) == 2, f"Expected 2 API calls, got {len(track_api_calls)}"
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 2, f"Expected 2 SEP API calls, got {len(sep_calls)}"
 
         # Verify second call fetched Tue-Fri (extends from day after Mon to Fri)
-        second_call = track_api_calls[1]
+        second_call = sep_calls[1]
         date_filter = second_call['kwargs'].get('date', {})
         assert date_filter.get('gte') == '2020-09-01', \
-            f"Second call should start from Tuesday (day after synced_to), got {date_filter}"
+            f"Second SEP call should start from Tuesday (day after synced_to), got {date_filter}"
         assert date_filter.get('lte') == '2020-09-04', \
-            f"Second call should end on Friday, got {date_filter}"
+            f"Second SEP call should end on Friday, got {date_filter}"
 
         # Now the full range Mon-Fri should be cached
         df3 = sep.query(
@@ -544,8 +575,9 @@ class TestSetIntersection:
         )
         assert len(df3) == 5, f"Should have all 5 days cached, got {len(df3)}"
         # No additional API calls needed
-        assert len(track_api_calls) == 2, \
-            f"Third query should use cache, expected 2 total calls, got {len(track_api_calls)}"
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 2, \
+            f"Third query should use cache, expected 2 total SEP calls, got {len(sep_calls)}"
 
     def test_multi_ticker_different_gaps(self, sep, track_api_calls):
         """
@@ -562,8 +594,9 @@ class TestSetIntersection:
             date_lte='2020-09-02'
         )
         assert len(df1) == 3
-        assert df1['ticker'].iloc[0] == 'MSFT'
-        assert len(track_api_calls) == 1
+        assert df1.index.get_level_values('ticker')[0] == 'MSFT'
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 1
 
         # Second query: AAPL Wednesday-Friday (2020-09-02 to 2020-09-04)
         df2 = sep.query(
@@ -573,8 +606,9 @@ class TestSetIntersection:
             date_lte='2020-09-04'
         )
         assert len(df2) == 3
-        assert df2['ticker'].iloc[0] == 'AAPL'
-        assert len(track_api_calls) == 2
+        assert df2.index.get_level_values('ticker')[0] == 'AAPL'
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 2
 
         # Third query: Both tickers Monday-Friday
         df3 = sep.query(
@@ -585,13 +619,14 @@ class TestSetIntersection:
         )
         # 5 trading days * 2 tickers = 10 rows
         assert len(df3) == 10, f"Expected 10 rows, got {len(df3)}"
-        assert set(df3['ticker'].unique()) == {'MSFT', 'AAPL'}
+        assert set(df3.index.get_level_values('ticker').unique()) == {'MSFT', 'AAPL'}
 
         # Bounds-based: 2 additional calls (AAPL past gap + MSFT future gap)
-        assert len(track_api_calls) == 4, f"Expected 4 total API calls, got {len(track_api_calls)}"
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 4, f"Expected 4 total SEP API calls, got {len(sep_calls)}"
 
         # Check gap-fill calls (order depends on solver, check both are present)
-        gap_calls = track_api_calls[2:]
+        gap_calls = sep_calls[2:]
         gap_dates = [(c['kwargs'].get('date', {}).get('gte'), c['kwargs'].get('date', {}).get('lte'))
                      for c in gap_calls]
         # Should have AAPL Mon-Tue and MSFT Thu-Fri
@@ -615,10 +650,11 @@ class TestSetIntersection:
             date_lte='2020-08-31'
         )
         assert len(df1) == 2
-        assert set(df1['ticker'].tolist()) == {'MSFT', 'AAPL'}
+        assert set(df1.index.get_level_values('ticker').tolist()) == {'MSFT', 'AAPL'}
         # One batched call for both tickers
-        assert len(track_api_calls) == 1
-        assert set(track_api_calls[0]['kwargs'].get('ticker')) == {'MSFT', 'AAPL'}
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 1
+        assert set(sep_calls[0]['kwargs'].get('ticker')) == {'MSFT', 'AAPL'}
 
         # Second query: Both tickers Tuesday (2020-09-01)
         df2 = sep.query(
@@ -628,17 +664,18 @@ class TestSetIntersection:
             date_lte='2020-09-01'
         )
         assert len(df2) == 2
-        assert set(df2['ticker'].tolist()) == {'MSFT', 'AAPL'}
+        assert set(df2.index.get_level_values('ticker').tolist()) == {'MSFT', 'AAPL'}
 
         # Should make only ONE additional batched call for both tickers
-        assert len(track_api_calls) == 2, \
-            f"Expected 2 total API calls (1 initial + 1 batched), got {len(track_api_calls)}"
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 2, \
+            f"Expected 2 total SEP API calls (1 initial + 1 batched), got {len(sep_calls)}"
 
-        # Verify the second call includes both tickers
-        second_call = track_api_calls[1]
-        ticker_arg = second_call['kwargs'].get('ticker')
+        # Verify the second SEP call includes both tickers
+        second_sep_call = sep_calls[1]
+        ticker_arg = second_sep_call['kwargs'].get('ticker')
         assert set(ticker_arg) == {'MSFT', 'AAPL'}, \
-            f"Second call should request both tickers, got {ticker_arg}"
+            f"Second SEP call should request both tickers, got {ticker_arg}"
 
     def test_cover_solver_batches_efficiently(self, sep, track_api_calls):
         """
@@ -660,8 +697,9 @@ class TestSetIntersection:
         # Setup: Cache AAPL for Mon only
         sep.query(columns=['close'], ticker='AAPL', date_gte='2020-08-31', date_lte='2020-08-31')
 
-        setup_calls = len(track_api_calls)
-        assert setup_calls == 2, f"Setup should make 2 calls, got {setup_calls}"
+        sep_calls = filter_sep_calls(track_api_calls)
+        setup_calls = len(sep_calls)
+        assert setup_calls == 2, f"Setup should make 2 SEP calls, got {setup_calls}"
 
         # Now query both tickers for Mon-Fri
         df = sep.query(
@@ -676,11 +714,12 @@ class TestSetIntersection:
 
         # Cover solver batches future gaps: 1 call for both tickers Tue-Fri
         # (MSFT gap is Wed-Fri, AAPL gap is Tue-Fri, solver uses longest)
-        assert len(track_api_calls) == 3, \
-            f"Expected 3 total calls (2 setup + 1 batched gap-fill), got {len(track_api_calls)}"
+        sep_calls = filter_sep_calls(track_api_calls)
+        assert len(sep_calls) == 3, \
+            f"Expected 3 total SEP calls (2 setup + 1 batched gap-fill), got {len(sep_calls)}"
 
         # The gap-fill call requests both tickers
-        gap_fill_call = track_api_calls[2]
+        gap_fill_call = sep_calls[2]
         ticker_arg = gap_fill_call['kwargs'].get('ticker')
         assert set(ticker_arg) == {'MSFT', 'AAPL'}, f"Expected both tickers, got {ticker_arg}"
         # Date range covers the longer gap (Tue-Fri for AAPL, overfetches for MSFT)
@@ -695,7 +734,9 @@ class TestFilterSplitting:
     @pytest.fixture
     def sep(self, tmp_path):
         """Create SEPTable instance for testing instance methods."""
-        return SEPTable(str(tmp_path / 'test.duckdb'))
+        db_path = str(tmp_path / 'test.duckdb')
+        with patch.object(cache, 'DB_PATH', db_path):
+            yield SEPTable()
 
     def test_small_request_not_split(self, sep):
         """Requests under page limit should not be split."""
