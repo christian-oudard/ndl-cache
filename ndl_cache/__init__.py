@@ -3,10 +3,9 @@ ndl-cache: Cached access to Nasdaq Data Link Sharadar tables.
 
 Usage:
     from ndl_cache import SEPTable, SFPTable, SF1Table, DailyTable, ActionsTable, TickersTable
-    from ndl_cache import set_db_path, get_db_path
 
-    # Optional: Set custom database path before creating tables
-    set_db_path('/path/to/cache.duckdb')
+    # Optional: Set custom database path via environment variable
+    # export NDL_CACHE_DB_PATH=/path/to/cache.duckdb
 
     # Query equity prices
     sep = SEPTable()
@@ -16,7 +15,6 @@ Usage:
 from . import cache
 from .cache import (
     CachedTable,
-    set_db_path,
     get_db_path,
 )
 from .tables import (
@@ -32,7 +30,6 @@ from .prices import PriceData
 __all__ = [
     'cache',
     'CachedTable',
-    'set_db_path',
     'get_db_path',
     'SEPTable',
     'SFPTable',

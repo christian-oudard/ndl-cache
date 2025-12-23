@@ -1,11 +1,13 @@
 import os
-import pandas as pd
-import nasdaqdatalink as ndl
-from pathlib import Path
-from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from pathlib import Path
+
 import duckdb
+import nasdaqdatalink as ndl
+import pandas as pd
 import warnings
+
 from .cover import solve_cover, find_gaps
 
 # Optimal parallelization level based on benchmarking ~10k row requests
@@ -22,37 +24,20 @@ NDL_SPLIT_THRESHOLD = 9000
 # Approximate trading days per calendar year
 TRADING_DAYS_PER_YEAR = 252
 
-# Sharadar data delay - don't mark recent dates as synced since data may still appear
-SHARADAR_DELAY_DAYS = 3
-
-# Default database path - can be overridden via set_db_path() or NDL_CACHE_DB_PATH env var
-
-def _default_db_path() -> str:
-    """Get default database path, respecting environment variable."""
+def get_db_path() -> str:
+    """Get database path from NDL_CACHE_DB_PATH env var or default to ~/.cache/ndl_cache/."""
     if 'NDL_CACHE_DB_PATH' in os.environ:
         return os.environ['NDL_CACHE_DB_PATH']
-    # Default to user cache directory
     cache_dir = Path.home() / '.cache' / 'ndl_cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
     return str(cache_dir / 'cache.duckdb')
 
-_db_path: str | None = None
 
-def set_db_path(path: str):
-    """Set the database path for all tables. Must be called before creating any tables."""
-    global _db_path
-    _db_path = path
-
-def get_db_path() -> str:
-    """Get the current database path."""
-    if _db_path is not None:
-        return _db_path
-    return _default_db_path()
-
-
-def _effective_sync_date(date_str: str) -> str:
-    """Cap a date to account for Sharadar's data delay."""
-    max_sync_date = (datetime.now() - timedelta(days=SHARADAR_DELAY_DAYS)).strftime('%Y-%m-%d')
+def _effective_sync_date(date_str: str, delay_days: int) -> str:
+    """Cap a date to account for data provider delays."""
+    if delay_days <= 0:
+        return date_str
+    max_sync_date = (datetime.now() - timedelta(days=delay_days)).strftime('%Y-%m-%d')
     return min(date_str, max_sync_date)
 
 
@@ -64,6 +49,7 @@ class CachedTable:
     date_column: str = 'date'  # Column used for date-based filtering and sync bounds
     column_types: dict[str, str] = {}  # Override column types (default: DOUBLE)
     rows_per_year: int = TRADING_DAYS_PER_YEAR  # Expected rows per ticker per year (for request size estimation)
+    sync_delay_days: int = 0  # Don't mark recent dates as synced (data may still appear)
 
     def __init__(self):
         self.conn = duckdb.connect(get_db_path())
@@ -129,10 +115,10 @@ class CachedTable:
     def _update_sync_bounds(self, ticker: str, from_date: str, to_date: str, max_lastupdated: str | None = None):
         """
         Update sync bounds for a ticker, expanding the existing range.
-        Caps to_date to account for Sharadar's data delay.
+        Caps to_date by sync_delay_days to avoid marking recent dates as synced.
         Also updates max_lastupdated if provided.
         """
-        effective_to = _effective_sync_date(to_date)
+        effective_to = _effective_sync_date(to_date, self.sync_delay_days)
 
         # Get existing bounds
         existing = self.conn.execute(f"""

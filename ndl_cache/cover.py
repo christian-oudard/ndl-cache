@@ -192,7 +192,6 @@ def _batch_gaps(
         # Try to add more tickers that fit within the same date range
         still_remaining = []
         for gap in remaining:
-            gap_days = gap.days()
             additional_rows = req_days * rows_per_ticker_day  # Each ticker adds req_days worth
 
             if current_rows + additional_rows <= max_rows:

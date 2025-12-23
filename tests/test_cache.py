@@ -1,13 +1,11 @@
-import pytest
 import json
 import pandas as pd
 from pathlib import Path
-from unittest.mock import patch
-import tempfile
-import os
 
-from ndl_cache import cache
-from ndl_cache import SEPTable
+import pytest
+
+from ndl_cache import cache, SEPTable
+from ndl_cache.testing import temp_db
 
 
 # Query fixture cache for mocking NDL API
@@ -87,13 +85,10 @@ def mock_ndl():
 @pytest.fixture
 def sep():
     """Create SEPTable with temp database."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, 'test.duckdb')
-        cache.set_db_path(db_path)
+    with temp_db():
         table = SEPTable()
         yield table
         table.conn.close()
-        cache.set_db_path(None)  # Reset to default
 
 
 @pytest.fixture
@@ -184,7 +179,6 @@ class TestSEPTableBasic:
         # Around the 4:1 split on 2020-08-31:
         # - closeunadj shows the actual price (big jump at split)
         # - close is split-adjusted (continuous)
-        closeunadj = df['closeunadj'].tolist()
         close = df['close'].tolist()
 
         # close should be relatively continuous (no 4x jump)
@@ -400,14 +394,12 @@ class TestFilterSplitting:
     """Tests for automatic request splitting to stay under page limit."""
 
     @pytest.fixture
-    def sep(self, tmp_path):
+    def sep(self):
         """Create SEPTable instance for testing instance methods."""
-        db_path = str(tmp_path / 'test.duckdb')
-        cache.set_db_path(db_path)
-        table = SEPTable()
-        yield table
-        table.conn.close()
-        cache.set_db_path(None)
+        with temp_db():
+            table = SEPTable()
+            yield table
+            table.conn.close()
 
     def test_small_request_not_split(self, sep):
         """Requests under page limit should not be split."""

@@ -6,7 +6,6 @@ Assumes 1 ticker × 1 day = 1 row for simplicity.
 
 Key insight: Gaps only occur at boundaries (before synced_from or after synced_to).
 """
-import pytest
 from ndl_cache.cover import Gap, Request, solve_cover, find_gaps
 
 

@@ -17,6 +17,7 @@ class SEPTable(CachedTable):
     table_name = 'SHARADAR/SEP'
     index_columns = ['ticker', 'date']
     query_columns = ['open', 'high', 'low', 'close', 'volume', 'closeadj', 'closeunadj', 'lastupdated']
+    sync_delay_days = 3
     column_types = {
         'ticker': 'VARCHAR',
         'date': 'DATE',
@@ -33,6 +34,7 @@ class SFPTable(CachedTable):
     table_name = 'SHARADAR/SFP'
     index_columns = ['ticker', 'date']
     query_columns = ['open', 'high', 'low', 'close', 'volume', 'closeadj', 'closeunadj', 'lastupdated']
+    sync_delay_days = 3
     column_types = {
         'ticker': 'VARCHAR',
         'date': 'DATE',
@@ -78,6 +80,7 @@ class SF1Table(CachedTable):
         'taxexp', 'taxliabilities', 'tbvps', 'workingcapital',
     ]
     rows_per_year = 18  # ~18 rows per ticker per year (4 quarterly + 1 annual across ~3-4 dimensions)
+    sync_delay_days = 3
     column_types = {
         'ticker': 'VARCHAR',
         'dimension': 'VARCHAR',
@@ -98,6 +101,7 @@ class DailyTable(CachedTable):
     table_name = 'SHARADAR/DAILY'
     index_columns = ['ticker', 'date']
     query_columns = ['marketcap', 'ev', 'pb', 'pe', 'ps', 'lastupdated']
+    sync_delay_days = 3
     column_types = {
         'ticker': 'VARCHAR',
         'date': 'DATE',
@@ -117,6 +121,7 @@ class ActionsTable(CachedTable):
     table_name = 'SHARADAR/ACTIONS'
     index_columns = ['ticker', 'date', 'action']
     query_columns = ['name', 'value', 'contraticker', 'contraname']
+    sync_delay_days = 3
     column_types = {
         'ticker': 'VARCHAR',
         'date': 'DATE',
