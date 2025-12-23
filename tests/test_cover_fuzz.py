@@ -6,7 +6,7 @@ Generates random sync bounds and validates the solver produces correct results.
 import random
 import pytest
 from datetime import datetime, timedelta
-from cover import Gap, Request, solve_cover, find_gaps
+from ndl_cache.cover import Gap, Request, solve_cover, find_gaps
 
 
 def random_date_range(start: str = '2024-01-01', end: str = '2024-12-31') -> tuple[str, str]:

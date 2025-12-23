@@ -1,4 +1,4 @@
-from cache import SEPTable
+from ndl_cache import SEPTable
 
 
 def main():

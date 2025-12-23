@@ -4,7 +4,7 @@ Sharadar table implementations.
 Each table defines its schema. Data is stored as-is from the API.
 Staleness is tracked via lastupdated column and checked once per day.
 """
-from cache import CachedTable
+from .cache import CachedTable
 
 
 class SEPTable(CachedTable):
@@ -86,4 +86,89 @@ class SF1Table(CachedTable):
         'reportperiod': 'DATE',
         'lastupdated': 'DATE',
         'fiscalperiod': 'VARCHAR',
+    }
+
+
+class DailyTable(CachedTable):
+    """
+    SHARADAR/DAILY - Daily valuation metrics.
+
+    Includes market cap, price ratios, and other daily calculated values.
+    """
+    table_name = 'SHARADAR/DAILY'
+    index_columns = ['ticker', 'date']
+    query_columns = ['marketcap', 'ev', 'pb', 'pe', 'ps', 'lastupdated']
+    column_types = {
+        'ticker': 'VARCHAR',
+        'date': 'DATE',
+        'lastupdated': 'DATE',
+    }
+
+
+class ActionsTable(CachedTable):
+    """
+    SHARADAR/ACTIONS - Corporate actions (dividends, splits, spinoffs).
+
+    Action types include:
+    - dividend: Cash dividend per share
+    - split: Stock split ratio (e.g., 2.0 for 2-for-1 split)
+    - spinoff: Spinoff events
+    """
+    table_name = 'SHARADAR/ACTIONS'
+    index_columns = ['ticker', 'date', 'action']
+    query_columns = ['name', 'value', 'contraticker', 'contraname']
+    column_types = {
+        'ticker': 'VARCHAR',
+        'date': 'DATE',
+        'action': 'VARCHAR',
+        'name': 'VARCHAR',
+        'contraticker': 'VARCHAR',
+        'contraname': 'VARCHAR',
+    }
+
+
+class TickersTable(CachedTable):
+    """
+    SHARADAR/TICKERS - Ticker metadata.
+
+    Contains category, exchange, and other static info for each ticker.
+    This table is special: no date-based filtering, synced per ticker.
+    """
+    table_name = 'SHARADAR/TICKERS'
+    index_columns = ['ticker']
+    date_column = None  # No date-based sync - sync entire ticker or nothing
+    query_columns = [
+        'name', 'exchange', 'category', 'cusips', 'siccode', 'sicsector',
+        'sicindustry', 'famasector', 'famaindustry', 'sector', 'industry',
+        'scalemarketcap', 'scalerevenue', 'currency', 'location', 'lastupdated',
+        'firstadded', 'firstpricedate', 'lastpricedate', 'firstquarter',
+        'lastquarter', 'secfilings', 'companysite', 'isdelisted', 'permaticker',
+    ]
+    column_types = {
+        'ticker': 'VARCHAR',
+        'name': 'VARCHAR',
+        'exchange': 'VARCHAR',
+        'category': 'VARCHAR',
+        'cusips': 'VARCHAR',
+        'siccode': 'VARCHAR',
+        'sicsector': 'VARCHAR',
+        'sicindustry': 'VARCHAR',
+        'famasector': 'VARCHAR',
+        'famaindustry': 'VARCHAR',
+        'sector': 'VARCHAR',
+        'industry': 'VARCHAR',
+        'scalemarketcap': 'VARCHAR',
+        'scalerevenue': 'VARCHAR',
+        'currency': 'VARCHAR',
+        'location': 'VARCHAR',
+        'lastupdated': 'DATE',
+        'firstadded': 'DATE',
+        'firstpricedate': 'DATE',
+        'lastpricedate': 'DATE',
+        'firstquarter': 'DATE',
+        'lastquarter': 'DATE',
+        'secfilings': 'VARCHAR',
+        'companysite': 'VARCHAR',
+        'isdelisted': 'VARCHAR',
+        'permaticker': 'INTEGER',
     }

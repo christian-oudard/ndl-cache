@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import nasdaqdatalink as ndl
 from pathlib import Path
@@ -5,7 +6,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import duckdb
 import warnings
-from cover import solve_cover, find_gaps
+from .cover import solve_cover, find_gaps
 
 # Optimal parallelization level based on benchmarking ~10k row requests
 # Higher values hit server-side throttling with diminishing returns
@@ -24,8 +25,29 @@ TRADING_DAYS_PER_YEAR = 252
 # Sharadar data delay - don't mark recent dates as synced since data may still appear
 SHARADAR_DELAY_DAYS = 3
 
-# Default database path
-DB_PATH = 'cache.duckdb'
+# Default database path - can be overridden via set_db_path() or NDL_CACHE_DB_PATH env var
+
+def _default_db_path() -> str:
+    """Get default database path, respecting environment variable."""
+    if 'NDL_CACHE_DB_PATH' in os.environ:
+        return os.environ['NDL_CACHE_DB_PATH']
+    # Default to user cache directory
+    cache_dir = Path.home() / '.cache' / 'ndl_cache'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return str(cache_dir / 'cache.duckdb')
+
+_db_path: str | None = None
+
+def set_db_path(path: str):
+    """Set the database path for all tables. Must be called before creating any tables."""
+    global _db_path
+    _db_path = path
+
+def get_db_path() -> str:
+    """Get the current database path."""
+    if _db_path is not None:
+        return _db_path
+    return _default_db_path()
 
 
 def _effective_sync_date(date_str: str) -> str:
@@ -44,7 +66,7 @@ class CachedTable:
     rows_per_year: int = TRADING_DAYS_PER_YEAR  # Expected rows per ticker per year (for request size estimation)
 
     def __init__(self):
-        self.conn = duckdb.connect(DB_PATH)
+        self.conn = duckdb.connect(get_db_path())
         self._ensure_sync_bounds_table()
 
     def _ensure_sync_bounds_table(self):
@@ -141,6 +163,34 @@ class CachedTable:
             (ticker, synced_from, synced_to, max_lastupdated, last_staleness_check)
             VALUES (?, ?, ?, ?, ?)
         """, [ticker, new_from, new_to, new_max_lastupdated, today])
+
+    def _mark_ticker_synced(self, ticker: str, max_lastupdated: str | None = None):
+        """
+        Mark a ticker as synced for tables without date columns (e.g., TICKERS table).
+        Uses NULL for synced_from/synced_to but still tracks max_lastupdated and staleness.
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # Check for existing entry to preserve max_lastupdated if newer
+        existing = self.conn.execute(f"""
+            SELECT max_lastupdated FROM {self._sync_bounds_table_name()}
+            WHERE ticker = ?
+        """, [ticker]).fetchone()
+
+        if existing and existing[0]:
+            old_max = str(existing[0])[:10]
+            if max_lastupdated and max_lastupdated > old_max:
+                new_max = max_lastupdated
+            else:
+                new_max = old_max
+        else:
+            new_max = max_lastupdated
+
+        self.conn.execute(f"""
+            INSERT OR REPLACE INTO {self._sync_bounds_table_name()}
+            (ticker, synced_from, synced_to, max_lastupdated, last_staleness_check)
+            VALUES (?, NULL, NULL, ?, ?)
+        """, [ticker, new_max, today])
 
     def _check_and_invalidate_stale(self, tickers: list[str]):
         """
@@ -434,16 +484,19 @@ class CachedTable:
 
         # Update sync bounds for all tickers in the filter sets
         # (even if we got no data - we still queried that range)
-        date_col = self.date_column
         today = datetime.now().strftime('%Y-%m-%d')
         for filters in filter_sets:
             ticker = filters.get('ticker')
-            date_gte = filters.get(f'{date_col}_gte', '1900-01-01')  # Full history if no filter
-            date_lte = filters.get(f'{date_col}_lte', today)
             if ticker:
                 tickers = ticker if isinstance(ticker, list) else [ticker]
                 for t in tickers:
-                    self._update_sync_bounds(t, date_gte, date_lte, max_lastupdated_by_ticker.get(t))
+                    if self.date_column is None:
+                        # Tables without date columns: just mark as synced
+                        self._mark_ticker_synced(t, max_lastupdated_by_ticker.get(t))
+                    else:
+                        date_gte = filters.get(f'{self.date_column}_gte', '1900-01-01')
+                        date_lte = filters.get(f'{self.date_column}_lte', today)
+                        self._update_sync_bounds(t, date_gte, date_lte, max_lastupdated_by_ticker.get(t))
 
         if len(queried) == 0:
             return 0
@@ -532,26 +585,35 @@ class CachedTable:
         else:
             tickers = []
 
-        # Get date filters using the table's date column
-        date_gte = filters.get(f'{self.date_column}_gte')
-        date_lte = filters.get(f'{self.date_column}_lte')
-
         # Check for stale data and invalidate if needed (once per day per ticker)
         if tickers:
             self._check_and_invalidate_stale(tickers)
 
-        # Sync data from NDL if needed
-        if tickers and date_gte and date_lte:
-            # Use cover solver to compute optimal fetches for gaps
-            optimal_fetches = self._compute_optimal_fetches(tickers, date_gte, date_lte)
-            if optimal_fetches:
-                self._sync_parallel(optimal_fetches)
-        elif tickers and not date_gte and not date_lte:
-            # No date filters - sync full history for unsynced tickers
-            sync_bounds = self._get_sync_bounds(tickers)
-            unsynced = [t for t in tickers if sync_bounds.get(t) is None]
-            if unsynced:
-                self._sync_parallel([{'ticker': t} for t in unsynced])
+        # Handle tables without date columns (e.g., TICKERS table)
+        if self.date_column is None:
+            if tickers:
+                # Sync any tickers that haven't been synced yet
+                sync_bounds = self._get_sync_bounds(tickers)
+                unsynced = [t for t in tickers if sync_bounds.get(t) is None]
+                if unsynced:
+                    self._sync_parallel([{'ticker': t} for t in unsynced])
+        else:
+            # Get date filters using the table's date column
+            date_gte = filters.get(f'{self.date_column}_gte')
+            date_lte = filters.get(f'{self.date_column}_lte')
+
+            # Sync data from NDL if needed
+            if tickers and date_gte and date_lte:
+                # Use cover solver to compute optimal fetches for gaps
+                optimal_fetches = self._compute_optimal_fetches(tickers, date_gte, date_lte)
+                if optimal_fetches:
+                    self._sync_parallel(optimal_fetches)
+            elif tickers and not date_gte and not date_lte:
+                # No date filters - sync full history for unsynced tickers
+                sync_bounds = self._get_sync_bounds(tickers)
+                unsynced = [t for t in tickers if sync_bounds.get(t) is None]
+                if unsynced:
+                    self._sync_parallel([{'ticker': t} for t in unsynced])
 
         # Get final result from cache (already indexed by index_columns)
         result = self.get_cached(**filters)

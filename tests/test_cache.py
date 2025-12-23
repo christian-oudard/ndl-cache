@@ -6,8 +6,8 @@ from unittest.mock import patch
 import tempfile
 import os
 
-import cache
-from tables import SEPTable
+from ndl_cache import cache
+from ndl_cache import SEPTable
 
 
 # Query fixture cache for mocking NDL API
@@ -89,10 +89,11 @@ def sep():
     """Create SEPTable with temp database."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, 'test.duckdb')
-        with patch.object(cache, 'DB_PATH', db_path):
-            table = SEPTable()
-            yield table
-            table.conn.close()
+        cache.set_db_path(db_path)
+        table = SEPTable()
+        yield table
+        table.conn.close()
+        cache.set_db_path(None)  # Reset to default
 
 
 @pytest.fixture
@@ -402,8 +403,11 @@ class TestFilterSplitting:
     def sep(self, tmp_path):
         """Create SEPTable instance for testing instance methods."""
         db_path = str(tmp_path / 'test.duckdb')
-        with patch.object(cache, 'DB_PATH', db_path):
-            yield SEPTable()
+        cache.set_db_path(db_path)
+        table = SEPTable()
+        yield table
+        table.conn.close()
+        cache.set_db_path(None)
 
     def test_small_request_not_split(self, sep):
         """Requests under page limit should not be split."""
