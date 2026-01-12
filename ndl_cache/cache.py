@@ -207,9 +207,9 @@ class CachedTable:
             return
 
         # Query API for one recent row per ticker to get current lastupdated
-        # Use a recent date range to ensure we get data
-        stale_tickers = []
-        for ticker in tickers_to_check:
+        # Use parallel requests to speed up cold start
+        def check_ticker_staleness(ticker):
+            """Check if a ticker's cached data is stale. Returns (ticker, is_stale)."""
             try:
                 # Get one row to check lastupdated
                 row = ndl.get_table(
@@ -221,19 +221,27 @@ class CachedTable:
                 if len(row) > 0 and 'lastupdated' in row.columns:
                     api_lastupdated = str(row['lastupdated'].max())[:10]
                     cached_lastupdated = sync_bounds[ticker].get('max_lastupdated')
-
-                    if cached_lastupdated and api_lastupdated > cached_lastupdated:
-                        stale_tickers.append(ticker)
-
-                # Update last_staleness_check regardless of staleness
-                self.conn.execute(f"""
-                    UPDATE {self._sync_bounds_table_name()}
-                    SET last_staleness_check = ?
-                    WHERE ticker = ?
-                """, [today, ticker])
+                    is_stale = cached_lastupdated and api_lastupdated > cached_lastupdated
+                    return (ticker, is_stale)
+                return (ticker, False)
             except Exception:
                 # If API check fails, skip this ticker
-                pass
+                return (ticker, False)
+
+        # Run staleness checks in parallel (same worker count as fetch operations)
+        stale_tickers = []
+        with ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as executor:
+            results = list(executor.map(check_ticker_staleness, tickers_to_check))
+
+        for ticker, is_stale in results:
+            if is_stale:
+                stale_tickers.append(ticker)
+            # Update last_staleness_check regardless of staleness
+            self.conn.execute(f"""
+                UPDATE {self._sync_bounds_table_name()}
+                SET last_staleness_check = ?
+                WHERE ticker = ?
+            """, [today, ticker])
 
         # Invalidate stale tickers by deleting their cached data and sync bounds
         for ticker in stale_tickers:
