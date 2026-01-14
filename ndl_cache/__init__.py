@@ -1,41 +1,79 @@
 """
 ndl-cache: Cached access to Nasdaq Data Link Sharadar tables.
 
-Usage:
-    from ndl_cache import SEPTable, SFPTable, SF1Table, DailyTable, ActionsTable, TickersTable
+Usage (sync):
+    from ndl_cache import SEP, query
 
-    # Optional: Set custom database path via environment variable
-    # export NDL_CACHE_DB_PATH=/path/to/cache.duckdb
+    df = query(SEP, ticker='AAPL', date_gte='2024-01-01', date_lte='2024-12-31')
 
-    # Query equity prices
-    sep = SEPTable()
-    df = sep.query(columns=['close', 'volume'], ticker='AAPL', date_gte='2020-01-01', date_lte='2020-12-31')
+Usage (async):
+    from ndl_cache import SEP, async_query
+
+    df = await async_query(SEP, ticker='AAPL', date_gte='2024-01-01', date_lte='2024-12-31')
+
+Available tables:
+    SEP - Daily equity prices (stocks)
+    SFP - Daily fund prices (ETFs, mutual funds)
+    SF1 - Core US Fundamentals
+    DAILY - Daily valuation metrics
+    ACTIONS - Corporate actions (dividends, splits, spinoffs)
+    TICKERS - Ticker metadata
+
+Optional: Set custom database path via environment variable:
+    export NDL_CACHE_DB_PATH=/path/to/cache.duckdb
 """
 
-from . import cache
-from .cache import (
-    CachedTable,
+# Table definitions
+from .tables import (
+    TableDef,
+    SEP,
+    SFP,
+    SF1,
+    DAILY,
+    ACTIONS,
+    TICKERS,
+)
+
+# Query functions
+from .async_cache import (
+    query,
+    async_query,
     get_db_path,
 )
-from .tables import (
-    SEPTable,
-    SFPTable,
-    SF1Table,
-    DailyTable,
-    ActionsTable,
-    TickersTable,
-)
+
+# Price data multiplexer
 from .prices import PriceData
 
+# Async client (for advanced use)
+from .async_client import (
+    AsyncNDLClient,
+    gather_tables,
+    NDLError,
+    AuthenticationError,
+    RateLimitError,
+    NotFoundError,
+)
+
 __all__ = [
-    'cache',
-    'CachedTable',
+    # Table definitions
+    'TableDef',
+    'SEP',
+    'SFP',
+    'SF1',
+    'DAILY',
+    'ACTIONS',
+    'TICKERS',
+    # Query functions
+    'query',
+    'async_query',
     'get_db_path',
-    'SEPTable',
-    'SFPTable',
-    'SF1Table',
-    'DailyTable',
-    'ActionsTable',
-    'TickersTable',
+    # Price data
     'PriceData',
+    # Async client
+    'AsyncNDLClient',
+    'gather_tables',
+    'NDLError',
+    'AuthenticationError',
+    'RateLimitError',
+    'NotFoundError',
 ]

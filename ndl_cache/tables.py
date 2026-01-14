@@ -1,66 +1,71 @@
 """
-Sharadar table implementations.
+Table definitions for Nasdaq Data Link Sharadar tables.
 
-Each table defines its schema. Data is stored as-is from the API.
-Staleness is tracked via lastupdated column and checked once per day.
+Each table is defined as a TableDef with its schema. Use query() or async_query()
+to fetch data from these tables.
 """
-from .cache import CachedTable
+from dataclasses import dataclass, field
+
+TRADING_DAYS_PER_YEAR = 252
 
 
-class SEPTable(CachedTable):
-    """
-    SHARADAR/SEP - Daily equity prices (stocks).
+@dataclass(frozen=True)
+class TableDef:
+    """Definition of a Sharadar table schema."""
+    name: str
+    index_columns: tuple[str, ...]
+    query_columns: tuple[str, ...]
+    date_column: str | None = 'date'
+    column_types: dict[str, str] = field(default_factory=dict)
+    rows_per_year: int = TRADING_DAYS_PER_YEAR
+    sync_delay_days: int = 0
 
-    Stores all price data as-is from Sharadar, including pre-computed
-    adjusted prices (closeadj, etc.).
-    """
-    table_name = 'SHARADAR/SEP'
-    index_columns = ['ticker', 'date']
-    query_columns = ['open', 'high', 'low', 'close', 'volume', 'closeadj', 'closeunadj', 'lastupdated']
-    sync_delay_days = 3
-    column_types = {
+    @property
+    def all_columns(self) -> list[str]:
+        """All columns (index + query)."""
+        return list(self.index_columns) + list(self.query_columns)
+
+    def safe_table_name(self) -> str:
+        """Table name safe for SQL (e.g., 'sharadar_sep')."""
+        return self.name.lower().replace('/', '_')
+
+    def sync_bounds_table_name(self) -> str:
+        """Name of the sync bounds tracking table."""
+        return f"{self.safe_table_name()}_sync_bounds"
+
+
+# Daily equity prices (stocks)
+SEP = TableDef(
+    name='SHARADAR/SEP',
+    index_columns=('ticker', 'date'),
+    query_columns=('open', 'high', 'low', 'close', 'volume', 'closeadj', 'closeunadj', 'lastupdated'),
+    sync_delay_days=3,
+    column_types={
         'ticker': 'VARCHAR',
         'date': 'DATE',
         'lastupdated': 'DATE',
-    }
+    },
+)
 
-
-class SFPTable(CachedTable):
-    """
-    SHARADAR/SFP - Daily fund prices (ETFs, mutual funds).
-
-    Stores all price data as-is from Sharadar.
-    """
-    table_name = 'SHARADAR/SFP'
-    index_columns = ['ticker', 'date']
-    query_columns = ['open', 'high', 'low', 'close', 'volume', 'closeadj', 'closeunadj', 'lastupdated']
-    sync_delay_days = 3
-    column_types = {
+# Daily fund prices (ETFs, mutual funds)
+SFP = TableDef(
+    name='SHARADAR/SFP',
+    index_columns=('ticker', 'date'),
+    query_columns=('open', 'high', 'low', 'close', 'volume', 'closeadj', 'closeunadj', 'lastupdated'),
+    sync_delay_days=3,
+    column_types={
         'ticker': 'VARCHAR',
         'date': 'DATE',
         'lastupdated': 'DATE',
-    }
+    },
+)
 
-
-class SF1Table(CachedTable):
-    """
-    SHARADAR/SF1 - Core US Fundamentals.
-
-    Contains income statement, balance sheet, cash flow, and derived metrics.
-    Data is provided quarterly, annually, and trailing-twelve-months.
-
-    Dimension codes:
-    - ARQ: As-reported quarterly (excludes restatements)
-    - MRQ: Most-recent quarterly (includes restatements)
-    - ARY: As-reported annual
-    - MRY: Most-recent annual
-    - ART: As-reported trailing-twelve-months
-    - MRT: Most-recent trailing-twelve-months
-    """
-    table_name = 'SHARADAR/SF1'
-    index_columns = ['ticker', 'dimension', 'datekey']
-    date_column = 'calendardate'  # Use calendardate for sync bounds (normalized date)
-    query_columns = [
+# Core US Fundamentals
+SF1 = TableDef(
+    name='SHARADAR/SF1',
+    index_columns=('ticker', 'dimension', 'datekey'),
+    date_column='calendardate',
+    query_columns=(
         'accoci', 'assets', 'assetsavg', 'assetsc', 'assetsnc', 'assetturnover',
         'bvps', 'calendardate', 'capex', 'cashneq', 'cashnequsd', 'consolinc',
         'cor', 'currentratio', 'de', 'debt', 'debtc', 'debtnc', 'debtusd',
@@ -78,10 +83,10 @@ class SF1Table(CachedTable):
         'rnd', 'roa', 'roe', 'roic', 'ros', 'sbcomp', 'sgna', 'sharefactor',
         'sharesbas', 'shareswa', 'shareswadil', 'sps', 'tangibles', 'taxassets',
         'taxexp', 'taxliabilities', 'tbvps', 'workingcapital',
-    ]
-    rows_per_year = 18  # ~18 rows per ticker per year (4 quarterly + 1 annual across ~3-4 dimensions)
-    sync_delay_days = 3
-    column_types = {
+    ),
+    rows_per_year=18,
+    sync_delay_days=3,
+    column_types={
         'ticker': 'VARCHAR',
         'dimension': 'VARCHAR',
         'datekey': 'DATE',
@@ -89,67 +94,51 @@ class SF1Table(CachedTable):
         'reportperiod': 'DATE',
         'lastupdated': 'DATE',
         'fiscalperiod': 'VARCHAR',
-    }
+    },
+)
 
-
-class DailyTable(CachedTable):
-    """
-    SHARADAR/DAILY - Daily valuation metrics.
-
-    Includes market cap, price ratios, and other daily calculated values.
-    """
-    table_name = 'SHARADAR/DAILY'
-    index_columns = ['ticker', 'date']
-    query_columns = ['marketcap', 'ev', 'pb', 'pe', 'ps', 'lastupdated']
-    sync_delay_days = 3
-    column_types = {
+# Daily valuation metrics
+DAILY = TableDef(
+    name='SHARADAR/DAILY',
+    index_columns=('ticker', 'date'),
+    query_columns=('marketcap', 'ev', 'pb', 'pe', 'ps', 'lastupdated'),
+    sync_delay_days=3,
+    column_types={
         'ticker': 'VARCHAR',
         'date': 'DATE',
         'lastupdated': 'DATE',
-    }
+    },
+)
 
-
-class ActionsTable(CachedTable):
-    """
-    SHARADAR/ACTIONS - Corporate actions (dividends, splits, spinoffs).
-
-    Action types include:
-    - dividend: Cash dividend per share
-    - split: Stock split ratio (e.g., 2.0 for 2-for-1 split)
-    - spinoff: Spinoff events
-    """
-    table_name = 'SHARADAR/ACTIONS'
-    index_columns = ['ticker', 'date', 'action']
-    query_columns = ['name', 'value', 'contraticker', 'contraname']
-    sync_delay_days = 3
-    column_types = {
+# Corporate actions (dividends, splits, spinoffs)
+ACTIONS = TableDef(
+    name='SHARADAR/ACTIONS',
+    index_columns=('ticker', 'date', 'action'),
+    query_columns=('name', 'value', 'contraticker', 'contraname'),
+    sync_delay_days=3,
+    column_types={
         'ticker': 'VARCHAR',
         'date': 'DATE',
         'action': 'VARCHAR',
         'name': 'VARCHAR',
         'contraticker': 'VARCHAR',
         'contraname': 'VARCHAR',
-    }
+    },
+)
 
-
-class TickersTable(CachedTable):
-    """
-    SHARADAR/TICKERS - Ticker metadata.
-
-    Contains category, exchange, and other static info for each ticker.
-    This table is special: no date-based filtering, synced per ticker.
-    """
-    table_name = 'SHARADAR/TICKERS'
-    index_columns = ['ticker']
-    date_column = None  # No date-based sync - sync entire ticker or nothing
-    query_columns = [
+# Ticker metadata
+TICKERS = TableDef(
+    name='SHARADAR/TICKERS',
+    index_columns=('ticker',),
+    date_column=None,  # No date-based sync
+    query_columns=(
         'name', 'exchange', 'category', 'cusips', 'siccode', 'sicsector',
         'sicindustry', 'famasector', 'famaindustry', 'sector', 'industry',
         'scalemarketcap', 'scalerevenue', 'currency', 'location', 'lastupdated',
         'firstadded', 'firstpricedate', 'lastpricedate', 'firstquarter',
         'lastquarter', 'secfilings', 'companysite', 'isdelisted', 'permaticker',
-    ]
-    column_types = {
+    ),
+    column_types={
         'ticker': 'VARCHAR',
         'name': 'VARCHAR',
         'exchange': 'VARCHAR',
@@ -176,4 +165,5 @@ class TickersTable(CachedTable):
         'companysite': 'VARCHAR',
         'isdelisted': 'VARCHAR',
         'permaticker': 'INTEGER',
-    }
+    },
+)

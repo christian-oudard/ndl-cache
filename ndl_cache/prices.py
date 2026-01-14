@@ -2,7 +2,8 @@
 Price data multiplexer that routes queries to SEP or SFP based on ticker category.
 """
 import pandas as pd
-from .tables import SEPTable, SFPTable, TickersTable
+from .tables import SEP, SFP, TICKERS
+from .async_cache import query
 
 
 # Categories that use SFP (fund prices) instead of SEP (equity prices)
@@ -23,9 +24,6 @@ class PriceData:
     """
 
     def __init__(self):
-        self.sep = SEPTable()
-        self.sfp = SFPTable()
-        self.tickers = TickersTable()
         self._category_cache: dict[str, str] = {}
 
     def get_categories(self, symbols: list[str]) -> dict[str, str]:
@@ -38,7 +36,7 @@ class PriceData:
 
         if unknown:
             # Query tickers table for unknown symbols
-            df = self.tickers.query(ticker=unknown)
+            df = query(TICKERS, ticker=unknown)
             if not df.empty:
                 for ticker, row in df.iterrows():
                     if isinstance(ticker, tuple):
@@ -68,7 +66,7 @@ class PriceData:
         """
         Query price data, routing to SEP or SFP based on symbol category.
 
-        Parameters match SEPTable/SFPTable.query():
+        Parameters:
             columns: List of columns to return (or None for all)
             ticker: Single ticker or list of tickers
             date_gte: Start date (inclusive)
@@ -76,6 +74,9 @@ class PriceData:
 
         Returns DataFrame indexed by (ticker, date) with requested columns.
         """
+        from concurrent.futures import ThreadPoolExecutor
+        from .async_cache import query as cache_query
+
         ticker_filter = filters.get('ticker')
         if ticker_filter is None:
             return pd.DataFrame()
@@ -87,21 +88,35 @@ class PriceData:
 
         equity_symbols, fund_symbols = self.split_by_category(tickers)
 
-        results = []
+        # Query SEP and SFP in parallel if we have both equity and fund symbols
+        if equity_symbols and fund_symbols:
+            equity_filters = {**filters, 'ticker': equity_symbols if len(equity_symbols) > 1 else equity_symbols[0]}
+            fund_filters = {**filters, 'ticker': fund_symbols if len(fund_symbols) > 1 else fund_symbols[0]}
 
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                sep_future = executor.submit(cache_query, SEP, columns=columns, **equity_filters)
+                sfp_future = executor.submit(cache_query, SFP, columns=columns, **fund_filters)
+
+                sep_result = sep_future.result()
+                sfp_result = sfp_future.result()
+
+            results = []
+            if not sep_result.empty:
+                results.append(sep_result)
+            if not sfp_result.empty:
+                results.append(sfp_result)
+
+            if not results:
+                return pd.DataFrame()
+            return pd.concat(results)
+
+        # Only one type of symbol - no need for parallelism
         if equity_symbols:
             equity_filters = {**filters, 'ticker': equity_symbols if len(equity_symbols) > 1 else equity_symbols[0]}
-            df = self.sep.query(columns=columns, **equity_filters)
-            if not df.empty:
-                results.append(df)
+            return cache_query(SEP, columns=columns, **equity_filters)
 
         if fund_symbols:
             fund_filters = {**filters, 'ticker': fund_symbols if len(fund_symbols) > 1 else fund_symbols[0]}
-            df = self.sfp.query(columns=columns, **fund_filters)
-            if not df.empty:
-                results.append(df)
+            return cache_query(SFP, columns=columns, **fund_filters)
 
-        if not results:
-            return pd.DataFrame()
-
-        return pd.concat(results)
+        return pd.DataFrame()
