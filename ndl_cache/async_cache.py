@@ -25,6 +25,16 @@ NDL_PAGE_LIMIT = 10000
 # Split threshold - stay well under page limit
 NDL_SPLIT_THRESHOLD = 9000
 
+# Lock per table for entire query operations (read-fetch-write cycle)
+_table_query_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_table_lock(table_name: str) -> asyncio.Lock:
+    """Get or create a lock for a specific table's query operations."""
+    if table_name not in _table_query_locks:
+        _table_query_locks[table_name] = asyncio.Lock()
+    return _table_query_locks[table_name]
+
 
 def is_cache_disabled() -> bool:
     """Check if cache is disabled via environment variable."""
@@ -61,10 +71,16 @@ class _CacheManager:
         self._conn: aioduckdb.Connection | None = None
         self._ndl_client: AsyncNDLClient | None = None
 
-    async def _get_conn(self) -> aioduckdb.Connection:
-        """Get or create the async DuckDB connection."""
+    async def _get_conn_without_init(self) -> aioduckdb.Connection:
+        """Get or create connection without table initialization."""
         if self._conn is None:
             self._conn = await aioduckdb.connect(self._db_path)
+        return self._conn
+
+    async def _get_conn(self) -> aioduckdb.Connection:
+        """Get or create the async DuckDB connection with table initialization."""
+        if self._conn is None:
+            await self._get_conn_without_init()
             await self._ensure_sync_bounds_table()
         return self._conn
 
@@ -91,7 +107,7 @@ class _CacheManager:
 
     async def _ensure_sync_bounds_table(self):
         """Create sync_bounds table if it doesn't exist."""
-        conn = await self._get_conn()
+        conn = await self._get_conn_without_init()
         await conn.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.table.sync_bounds_table_name()} (
                 ticker VARCHAR PRIMARY KEY,
@@ -168,11 +184,18 @@ class _CacheManager:
             new_max_lastupdated = max_lastupdated
 
         today = datetime.now().strftime('%Y-%m-%d')
-        await conn.execute(f"""
-            INSERT OR REPLACE INTO {self.table.sync_bounds_table_name()}
-            (ticker, synced_from, synced_to, max_lastupdated, last_staleness_check)
-            VALUES (?, ?, ?, ?, ?)
-        """, [ticker, new_from, new_to, new_max_lastupdated, today])
+        if existing:
+            await conn.execute(f"""
+                UPDATE {self.table.sync_bounds_table_name()}
+                SET synced_from = ?, synced_to = ?, max_lastupdated = ?, last_staleness_check = ?
+                WHERE ticker = ?
+            """, [new_from, new_to, new_max_lastupdated, today, ticker])
+        else:
+            await conn.execute(f"""
+                INSERT INTO {self.table.sync_bounds_table_name()}
+                (ticker, synced_from, synced_to, max_lastupdated, last_staleness_check)
+                VALUES (?, ?, ?, ?, ?)
+            """, [ticker, new_from, new_to, new_max_lastupdated, today])
 
     async def _mark_ticker_synced(self, ticker: str, max_lastupdated: str | None = None):
         """Mark a ticker as synced for tables without date columns."""
@@ -194,11 +217,18 @@ class _CacheManager:
         else:
             new_max = max_lastupdated
 
-        await conn.execute(f"""
-            INSERT OR REPLACE INTO {self.table.sync_bounds_table_name()}
-            (ticker, synced_from, synced_to, max_lastupdated, last_staleness_check)
-            VALUES (?, NULL, NULL, ?, ?)
-        """, [ticker, new_max, today])
+        if existing:
+            await conn.execute(f"""
+                UPDATE {self.table.sync_bounds_table_name()}
+                SET max_lastupdated = ?, last_staleness_check = ?
+                WHERE ticker = ?
+            """, [new_max, today, ticker])
+        else:
+            await conn.execute(f"""
+                INSERT INTO {self.table.sync_bounds_table_name()}
+                (ticker, synced_from, synced_to, max_lastupdated, last_staleness_check)
+                VALUES (?, NULL, NULL, ?, ?)
+            """, [ticker, new_max, today])
 
     async def _invalidate_ticker(self, ticker: str):
         """Delete all cached data and sync bounds for a ticker."""
@@ -468,10 +498,12 @@ class _CacheManager:
         placeholders = ', '.join(['?'] * len(cols))
         col_names = ', '.join(cols)
 
+        # Dedupe in case API returns duplicate rows
+        store_df = store_df.drop_duplicates(subset=list(self.table.index_columns))
         rows = [tuple(row) for row in store_df.itertuples(index=False, name=None)]
 
         await conn.executemany(f"""
-            INSERT OR REPLACE INTO {self.table.safe_table_name()} ({col_names})
+            INSERT INTO {self.table.safe_table_name()} ({col_names})
             VALUES ({placeholders})
         """, rows)
 
@@ -541,9 +573,6 @@ class _CacheManager:
         else:
             tickers = []
 
-        if tickers:
-            await self._check_and_invalidate_stale(tickers)
-
         if is_cache_disabled():
             if tickers:
                 fetch_filters = dict(filters)
@@ -556,28 +585,34 @@ class _CacheManager:
                 return result
             return pd.DataFrame()
 
-        if self.table.date_column is None:
+        # Lock the entire read-fetch-write cycle per table to prevent race conditions
+        lock = _get_table_lock(self.table.name)
+        async with lock:
             if tickers:
-                sync_bounds = await self._get_sync_bounds(tickers)
-                unsynced = [t for t in tickers if sync_bounds.get(t) is None]
-                if unsynced:
-                    await self._sync_parallel([{'ticker': t} for t in unsynced])
-        else:
-            date_gte = filters.get(f'{self.table.date_column}_gte')
-            date_lte = filters.get(f'{self.table.date_column}_lte')
+                await self._check_and_invalidate_stale(tickers)
 
-            if tickers and date_gte and date_lte:
-                sync_bounds_raw = await self._get_sync_bounds(tickers)
-                optimal_fetches = self._compute_optimal_fetches(tickers, date_gte, date_lte, sync_bounds_raw)
-                if optimal_fetches:
-                    await self._sync_parallel(optimal_fetches)
-            elif tickers and not date_gte and not date_lte:
-                sync_bounds = await self._get_sync_bounds(tickers)
-                unsynced = [t for t in tickers if sync_bounds.get(t) is None]
-                if unsynced:
-                    await self._sync_parallel([{'ticker': t} for t in unsynced])
+            if self.table.date_column is None:
+                if tickers:
+                    sync_bounds = await self._get_sync_bounds(tickers)
+                    unsynced = [t for t in tickers if sync_bounds.get(t) is None]
+                    if unsynced:
+                        await self._sync_parallel([{'ticker': t} for t in unsynced])
+            else:
+                date_gte = filters.get(f'{self.table.date_column}_gte')
+                date_lte = filters.get(f'{self.table.date_column}_lte')
 
-        result = await self.get_cached(**filters)
+                if tickers and date_gte and date_lte:
+                    sync_bounds_raw = await self._get_sync_bounds(tickers)
+                    optimal_fetches = self._compute_optimal_fetches(tickers, date_gte, date_lte, sync_bounds_raw)
+                    if optimal_fetches:
+                        await self._sync_parallel(optimal_fetches)
+                elif tickers and not date_gte and not date_lte:
+                    sync_bounds = await self._get_sync_bounds(tickers)
+                    unsynced = [t for t in tickers if sync_bounds.get(t) is None]
+                    if unsynced:
+                        await self._sync_parallel([{'ticker': t} for t in unsynced])
+
+            result = await self.get_cached(**filters)
 
         if len(result) == 0:
             return pd.DataFrame()

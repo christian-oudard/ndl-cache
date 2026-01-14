@@ -548,3 +548,210 @@ class TestSyncBounds:
         assert synced_to is not None
         # max_lastupdated should be populated from the fetched data
         # (will be None if lastupdated wasn't in the response)
+
+
+class TestConcurrentAccess:
+    """
+    Test concurrent access doesn't cause race conditions.
+
+    These tests mock the API but exercise real concurrent DuckDB operations
+    to catch race conditions in table creation and data insertion.
+    """
+
+    @pytest.fixture
+    def mock_api_with_delay(self):
+        """
+        Create a mock API that adds a small delay to increase race window.
+
+        The delay makes it more likely that concurrent coroutines will
+        interleave their DuckDB operations.
+        """
+        import asyncio
+
+        async def delayed_get_table(self, table_name, columns=None, paginate=True, **filters):
+            # Small delay to widen the race window
+            await asyncio.sleep(0.01)
+
+            # Return mock data based on table and filters
+            ticker = filters.get('ticker', 'TEST')
+            if isinstance(ticker, list):
+                ticker = ticker[0]
+
+            date_gte = filters.get('date', {}).get('gte', '2020-08-28')
+            date_lte = filters.get('date', {}).get('lte', '2020-08-28')
+
+            # Generate mock data
+            if 'SEP' in table_name or 'SFP' in table_name:
+                return pd.DataFrame({
+                    'ticker': [ticker],
+                    'date': [date_gte],
+                    'close': [100.0],
+                    'closeunadj': [100.0],
+                    'volume': [1000000],
+                    'lastupdated': [date_gte],
+                })
+            elif 'ACTIONS' in table_name:
+                action = filters.get('action', 'dividend')
+                return pd.DataFrame({
+                    'ticker': [ticker],
+                    'date': [date_gte],
+                    'action': [action],
+                    'value': [0.5],
+                    'lastupdated': [date_gte],
+                })
+            elif 'DAILY' in table_name:
+                return pd.DataFrame({
+                    'ticker': [ticker],
+                    'date': [date_gte],
+                    'marketcap': [1e9],
+                    'lastupdated': [date_gte],
+                })
+            else:
+                return pd.DataFrame()
+
+        return delayed_get_table
+
+    @pytest.mark.asyncio
+    async def test_concurrent_table_creation(self, use_temp_db, mock_api_with_delay):
+        """
+        Multiple concurrent queries should not conflict when creating tables.
+
+        This reproduces the race condition:
+        "TransactionContext Error: Catalog write-write conflict on create with Table"
+        """
+        import asyncio
+
+        with patch.object(AsyncNDLClient, 'get_table', mock_api_with_delay):
+            # Run multiple queries that will all try to create the same table
+            results = await asyncio.gather(
+                async_query(SEP, ticker='AAPL', date_gte='2020-08-28', date_lte='2020-08-28'),
+                async_query(SEP, ticker='MSFT', date_gte='2020-08-28', date_lte='2020-08-28'),
+                async_query(SEP, ticker='GOOGL', date_gte='2020-08-28', date_lte='2020-08-28'),
+                async_query(SEP, ticker='AMZN', date_gte='2020-08-28', date_lte='2020-08-28'),
+                return_exceptions=True,
+            )
+
+        # Check for race condition errors
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                error_msg = str(result).lower()
+                assert 'conflict' not in error_msg, f"Table creation race: {result}"
+                assert 'catalog' not in error_msg, f"Table creation race: {result}"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_sync_bounds_insert(self, use_temp_db, mock_api_with_delay):
+        """
+        Concurrent queries for the same ticker should not conflict on sync_bounds.
+
+        This reproduces the race condition:
+        "Constraint Error: Duplicate key ticker: AAPL violates primary key"
+        """
+        import asyncio
+
+        with patch.object(AsyncNDLClient, 'get_table', mock_api_with_delay):
+            # All queries for the same ticker - they'll race to insert sync_bounds
+            results = await asyncio.gather(
+                async_query(SEP, ticker='AAPL', date_gte='2020-08-28', date_lte='2020-08-28'),
+                async_query(SEP, ticker='AAPL', date_gte='2020-08-29', date_lte='2020-08-29'),
+                async_query(SEP, ticker='AAPL', date_gte='2020-08-30', date_lte='2020-08-30'),
+                async_query(SEP, ticker='AAPL', date_gte='2020-08-31', date_lte='2020-08-31'),
+                return_exceptions=True,
+            )
+
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                error_msg = str(result).lower()
+                assert 'duplicate' not in error_msg, f"Sync bounds insert race: {result}"
+                assert 'constraint' not in error_msg, f"Sync bounds insert race: {result}"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_data_insert_same_rows(self, use_temp_db):
+        """
+        Concurrent queries that return overlapping data should not conflict.
+
+        This reproduces the race condition where two queries fetch and try
+        to insert the same rows into the data table.
+        """
+        import asyncio
+
+        # Mock that returns the SAME data for different queries
+        # This simulates the case where dividend and split queries both
+        # try to insert the same rows
+        async def mock_returning_same_data(self, table_name, columns=None, paginate=True, **filters):
+            await asyncio.sleep(0.01)
+            # Always return the same row regardless of filters
+            return pd.DataFrame({
+                'ticker': ['AAPL'],
+                'date': ['2020-08-28'],
+                'action': ['dividend'],
+                'value': [0.5],
+                'lastupdated': ['2020-08-28'],
+            })
+
+        from ndl_cache import ACTIONS
+
+        with patch.object(AsyncNDLClient, 'get_table', mock_returning_same_data):
+            # Multiple queries that will all try to insert the same row
+            results = await asyncio.gather(
+                async_query(ACTIONS, ticker='AAPL', date_gte='2020-08-28', date_lte='2020-08-28', action='dividend'),
+                async_query(ACTIONS, ticker='AAPL', date_gte='2020-08-28', date_lte='2020-08-28', action='dividend'),
+                async_query(ACTIONS, ticker='AAPL', date_gte='2020-08-28', date_lte='2020-08-28', action='dividend'),
+                return_exceptions=True,
+            )
+
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                error_msg = str(result).lower()
+                assert 'duplicate' not in error_msg, f"Data insert race: {result}"
+                assert 'constraint' not in error_msg, f"Data insert race: {result}"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_different_tables(self, use_temp_db, mock_api_with_delay):
+        """
+        Concurrent queries to different tables should not conflict.
+
+        Each table has its own sync_bounds table, so concurrent creation
+        of different sync_bounds tables should not race.
+        """
+        import asyncio
+        from ndl_cache import ACTIONS, DAILY
+
+        with patch.object(AsyncNDLClient, 'get_table', mock_api_with_delay):
+            results = await asyncio.gather(
+                async_query(SEP, ticker='AAPL', date_gte='2020-08-28', date_lte='2020-08-28'),
+                async_query(ACTIONS, ticker='AAPL', date_gte='2020-08-28', date_lte='2020-08-28', action='dividend'),
+                async_query(DAILY, ticker='AAPL', date_gte='2020-08-28', date_lte='2020-08-28'),
+                return_exceptions=True,
+            )
+
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                error_msg = str(result).lower()
+                assert 'conflict' not in error_msg, f"Cross-table race: {result}"
+                assert 'duplicate' not in error_msg, f"Cross-table race: {result}"
+
+    @pytest.mark.asyncio
+    async def test_high_concurrency_stress(self, use_temp_db, mock_api_with_delay):
+        """
+        Stress test with many concurrent queries to maximize race probability.
+        """
+        import asyncio
+
+        tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'JPM']
+
+        with patch.object(AsyncNDLClient, 'get_table', mock_api_with_delay):
+            # Create many concurrent queries
+            queries = [
+                async_query(SEP, ticker=ticker, date_gte='2020-08-28', date_lte='2020-08-28')
+                for ticker in tickers
+            ]
+            results = await asyncio.gather(*queries, return_exceptions=True)
+
+        race_errors = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                error_msg = str(result).lower()
+                if 'conflict' in error_msg or 'duplicate' in error_msg or 'constraint' in error_msg:
+                    race_errors.append(f"Query {i} ({tickers[i]}): {result}")
+
+        assert not race_errors, f"Race condition errors:\n" + "\n".join(race_errors)
