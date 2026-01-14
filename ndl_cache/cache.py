@@ -24,6 +24,12 @@ NDL_SPLIT_THRESHOLD = 9000
 # Approximate trading days per calendar year
 TRADING_DAYS_PER_YEAR = 252
 
+
+def is_cache_disabled() -> bool:
+    """Check if cache is disabled via environment variable."""
+    return os.environ.get('NDL_CACHE_DISABLED', '').lower() in ('1', 'true', 'yes')
+
+
 def get_db_path() -> str:
     """Get database path from NDL_CACHE_DB_PATH env var or default to ~/.cache/ndl_cache/."""
     if 'NDL_CACHE_DB_PATH' in os.environ:
@@ -582,6 +588,21 @@ class CachedTable:
         # Check for stale data and invalidate if needed (once per day per ticker)
         if tickers:
             self._check_and_invalidate_stale(tickers)
+
+        # When cache is disabled, fetch directly from NDL without caching
+        if is_cache_disabled():
+            if tickers:
+                # Pass all filters through to the NDL fetch (not just date/ticker)
+                fetch_filters = dict(filters)
+                fetch_filters['ticker'] = tickers
+                result = self._fetch_parallel([fetch_filters])
+                # Index by index_columns to match get_cached format
+                if not result.empty and self.index_columns:
+                    index_cols = [c for c in self.index_columns if c in result.columns]
+                    if index_cols:
+                        result = result.set_index(index_cols)
+                return result
+            return pd.DataFrame()
 
         # Handle tables without date columns (e.g., TICKERS table)
         if self.date_column is None:
