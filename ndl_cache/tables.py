@@ -61,10 +61,12 @@ SFP = TableDef(
 )
 
 # Core US Fundamentals
+# rows_per_year=None because actual rows depend heavily on dimension filter
 SF1 = TableDef(
     name='SHARADAR/SF1',
     index_columns=('ticker', 'dimension', 'datekey'),
     date_column='calendardate',
+    rows_per_year=None,
     query_columns=(
         'accoci', 'assets', 'assetsavg', 'assetsc', 'assetsnc', 'assetturnover',
         'bvps', 'calendardate', 'capex', 'cashneq', 'cashnequsd', 'consolinc',
@@ -84,7 +86,6 @@ SF1 = TableDef(
         'sharesbas', 'shareswa', 'shareswadil', 'sps', 'tangibles', 'taxassets',
         'taxexp', 'taxliabilities', 'tbvps', 'workingcapital',
     ),
-    rows_per_year=18,
     sync_delay_days=3,
     column_types={
         'ticker': 'VARCHAR',
