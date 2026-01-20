@@ -522,6 +522,24 @@ class TestFilterSplitting:
         est = mgr._estimate_rows(filters)
         assert 2500 <= est <= 2600
 
+    def test_skip_split_when_rows_per_year_none(self, use_temp_db):
+        """Tables with rows_per_year=None should skip splitting (e.g., ACTIONS)."""
+        from ndl_cache import ACTIONS
+
+        # ACTIONS has rows_per_year=None for sparse data
+        assert ACTIONS.rows_per_year is None
+
+        actions_mgr = _CacheManager(ACTIONS)
+
+        # Even with many tickers and long date range, should NOT split
+        tickers = [f'T{i:03d}' for i in range(100)]
+        filters = {'ticker': tickers, 'date_gte': '1990-01-01', 'date_lte': '2024-12-31'}
+        chunks = actions_mgr._split_filters(filters)
+
+        # Should return single chunk (no splitting)
+        assert len(chunks) == 1
+        assert chunks[0] == filters
+
 
 class TestSyncBounds:
     """Test sync bounds tracking with new schema."""

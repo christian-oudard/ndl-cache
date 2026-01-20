@@ -312,6 +312,8 @@ class _CacheManager:
         """Estimate number of rows per ticker for a date range."""
         if not (date_gte and date_lte):
             return 1
+        # Caller should check rows_per_year is not None before calling
+        assert self.table.rows_per_year is not None
         start = datetime.strptime(date_gte, '%Y-%m-%d')
         end = datetime.strptime(date_lte, '%Y-%m-%d')
         calendar_days = (end - start).days + 1
@@ -330,6 +332,10 @@ class _CacheManager:
 
     def _split_filters(self, filters: dict, max_rows: int = NDL_SPLIT_THRESHOLD) -> list[dict]:
         """Split a filter set into chunks that each return < max_rows."""
+        # Skip splitting for tables with unknown row density (e.g., sparse ACTIONS table)
+        if self.table.rows_per_year is None:
+            return [filters]
+
         est_rows = self._estimate_rows(filters)
         if est_rows < max_rows:
             return [filters]

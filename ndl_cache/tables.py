@@ -17,7 +17,7 @@ class TableDef:
     query_columns: tuple[str, ...]
     date_column: str | None = 'date'
     column_types: dict[str, str] = field(default_factory=dict)
-    rows_per_year: int = TRADING_DAYS_PER_YEAR
+    rows_per_year: int | None = TRADING_DAYS_PER_YEAR  # None = skip row estimation/splitting
     sync_delay_days: int = 0
 
     @property
@@ -111,11 +111,13 @@ DAILY = TableDef(
 )
 
 # Corporate actions (dividends, splits, spinoffs)
+# rows_per_year=None because actions are sparse (few per ticker per year)
 ACTIONS = TableDef(
     name='SHARADAR/ACTIONS',
     index_columns=('ticker', 'date', 'action'),
     query_columns=('name', 'value', 'contraticker', 'contraname'),
     sync_delay_days=3,
+    rows_per_year=None,
     column_types={
         'ticker': 'VARCHAR',
         'date': 'DATE',
