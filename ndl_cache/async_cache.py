@@ -5,7 +5,6 @@ Provides async_query() for async access and query() for sync access.
 """
 import asyncio
 import os
-import random
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -20,10 +19,6 @@ from .tables import TableDef, TRADING_DAYS_PER_YEAR
 
 # Optimal parallelization level based on benchmarking ~10k row requests
 MAX_FETCH_WORKERS = 4
-
-# Retry settings for database connection (handles cross-process contention)
-DB_CONNECT_MAX_RETRIES = 5
-DB_CONNECT_BASE_DELAY = 0.1  # seconds
 
 # NDL API page limit
 NDL_PAGE_LIMIT = 10000
@@ -78,27 +73,22 @@ class _CacheManager:
         self._ndl_client: AsyncNDLClient | None = None
 
     async def _get_conn_without_init(self) -> aioduckdb.Connection:
-        """Get or create connection without table initialization.
-
-        Retries with exponential backoff if the database is locked by another process.
-        """
+        """Get or create connection without table initialization."""
         if self._conn is not None:
             return self._conn
 
-        last_error: Exception | None = None
-        for attempt in range(DB_CONNECT_MAX_RETRIES):
-            try:
-                self._conn = await aioduckdb.connect(self._db_path)
-                return self._conn
-            except duckdb.IOException as e:
-                last_error = e
-                if attempt < DB_CONNECT_MAX_RETRIES - 1:
-                    # Exponential backoff with jitter
-                    delay = DB_CONNECT_BASE_DELAY * (2 ** attempt) * (0.5 + random.random())
-                    await asyncio.sleep(delay)
-
-        assert last_error is not None
-        raise last_error
+        try:
+            self._conn = await aioduckdb.connect(self._db_path)
+            return self._conn
+        except duckdb.IOException as e:
+            wal_file = Path(self._db_path + '.wal')
+            if wal_file.exists():
+                raise duckdb.IOException(
+                    f"Database is locked. Only one process can access the cache at a time.\n"
+                    f"If no other process is running, delete stale lock files:\n"
+                    f"  rm {self._db_path}.wal*"
+                ) from e
+            raise
 
     async def _get_conn(self) -> aioduckdb.Connection:
         """Get or create the async DuckDB connection with table initialization."""
