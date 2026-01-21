@@ -26,15 +26,43 @@ NDL_PAGE_LIMIT = 10000
 # Split threshold - stay well under page limit
 NDL_SPLIT_THRESHOLD = 9000
 
-# Lock per table for entire query operations (read-fetch-write cycle)
-_table_query_locks: dict[str, asyncio.Lock] = {}
+# Module-level event loop for sync query() function.
+#
+# Problem: asyncio.run() creates a new event loop and closes it after each call.
+# asyncio.Lock objects are bound to the event loop that was running when they
+# were created. When asyncio.run() is called again with a new event loop, the
+# locks are still bound to the old (closed) loop, causing:
+#     RuntimeError: <asyncio.locks.Lock ...> is bound to a different event loop
+#
+# Solution: Use a persistent event loop for all sync query() calls.
+_event_loop: asyncio.AbstractEventLoop | None = None
 
 
-def _get_table_lock(table_name: str) -> asyncio.Lock:
+def _get_event_loop() -> asyncio.AbstractEventLoop:
+    """Get or create a persistent event loop for sync query operations."""
+    global _event_loop
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.new_event_loop()
+    return _event_loop
+
+
+def _run_sync(coro):
+    """Run an async coroutine synchronously using the persistent event loop."""
+    loop = _get_event_loop()
+    return loop.run_until_complete(coro)
+
+
+# Lock per table for entire query operations (read-fetch-write cycle).
+# Keyed by (table_name, event_loop_id) to handle event loop changes.
+_table_query_locks: dict[tuple[str, int], asyncio.Lock] = {}
+
+
+def _get_table_lock(table_name: str, loop: asyncio.AbstractEventLoop) -> asyncio.Lock:
     """Get or create a lock for a specific table's query operations."""
-    if table_name not in _table_query_locks:
-        _table_query_locks[table_name] = asyncio.Lock()
-    return _table_query_locks[table_name]
+    key = (table_name, id(loop))
+    if key not in _table_query_locks:
+        _table_query_locks[key] = asyncio.Lock()
+    return _table_query_locks[key]
 
 
 def is_cache_disabled() -> bool:
@@ -605,7 +633,8 @@ class _CacheManager:
             return pd.DataFrame()
 
         # Lock the entire read-fetch-write cycle per table to prevent race conditions
-        lock = _get_table_lock(self.table.name)
+        loop = asyncio.get_running_loop()
+        lock = _get_table_lock(self.table.name, loop)
         async with lock:
             if tickers:
                 await self._check_and_invalidate_stale(tickers)
@@ -694,4 +723,4 @@ def query(
 
         df = query(SEP, ticker='AAPL', date_gte='2024-01-01', date_lte='2024-12-31')
     """
-    return asyncio.run(async_query(table, columns=columns, **filters))
+    return _run_sync(async_query(table, columns=columns, **filters))
