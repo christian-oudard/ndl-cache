@@ -4,8 +4,8 @@ Async cache layer using aioduckdb for non-blocking DuckDB operations.
 Provides async_query() for async access and query() for sync access.
 """
 import asyncio
-import atexit
 import os
+import weakref
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -27,7 +27,7 @@ NDL_PAGE_LIMIT = 10000
 # Split threshold - stay well under page limit
 NDL_SPLIT_THRESHOLD = 9000
 
-# Module-level event loop for sync query() function.
+# Lock per table for entire query operations (read-fetch-write cycle).
 #
 # Problem: asyncio.run() creates a new event loop and closes it after each call.
 # asyncio.Lock objects are bound to the event loop that was running when they
@@ -35,50 +35,26 @@ NDL_SPLIT_THRESHOLD = 9000
 # locks are still bound to the old (closed) loop, causing:
 #     RuntimeError: <asyncio.locks.Lock ...> is bound to a different event loop
 #
-# Solution: Use a persistent event loop for all sync query() calls.
-_event_loop: asyncio.AbstractEventLoop | None = None
-
-
-def _get_event_loop() -> asyncio.AbstractEventLoop:
-    """Get or create a persistent event loop for sync query operations."""
-    global _event_loop
-    if _event_loop is None or _event_loop.is_closed():
-        _event_loop = asyncio.new_event_loop()
-    return _event_loop
-
-
-def _run_sync(coro):
-    """Run an async coroutine synchronously using the persistent event loop."""
-    loop = _get_event_loop()
-    return loop.run_until_complete(coro)
-
-
-def _cleanup_event_loop():
-    """Clean up the persistent event loop on process exit.
-
-    This ensures aioduckdb connections are properly closed before the process
-    exits, preventing file lock issues when subprocesses use ndl-cache.
-    """
-    global _event_loop
-    if _event_loop is not None and not _event_loop.is_closed():
-        _event_loop.close()
-        _event_loop = None
-
-
-atexit.register(_cleanup_event_loop)
-
-
-# Lock per table for entire query operations (read-fetch-write cycle).
-# Keyed by (table_name, event_loop_id) to handle event loop changes.
-_table_query_locks: dict[tuple[str, int], asyncio.Lock] = {}
+# Solution: Store a weak reference to the event loop along with the lock. When
+# getting a lock, we compare the actual loop objects (not just their ids, since
+# Python can reuse memory addresses after garbage collection). If the stored
+# loop is gone or different, we create a new lock for the current loop.
+_table_query_locks: dict[str, tuple[weakref.ref, asyncio.Lock]] = {}
 
 
 def _get_table_lock(table_name: str, loop: asyncio.AbstractEventLoop) -> asyncio.Lock:
     """Get or create a lock for a specific table's query operations."""
-    key = (table_name, id(loop))
-    if key not in _table_query_locks:
-        _table_query_locks[key] = asyncio.Lock()
-    return _table_query_locks[key]
+    existing = _table_query_locks.get(table_name)
+    if existing is not None:
+        loop_ref, lock = existing
+        # Check if this lock is for the current loop (same object, not just same id)
+        if loop_ref() is loop:
+            return lock
+        # Old loop was garbage collected or this is a different loop - create new lock
+
+    lock = asyncio.Lock()
+    _table_query_locks[table_name] = (weakref.ref(loop), lock)
+    return lock
 
 
 def is_cache_disabled() -> bool:
@@ -117,22 +93,40 @@ class _CacheManager:
         self._ndl_client: AsyncNDLClient | None = None
 
     async def _get_conn_without_init(self) -> aioduckdb.Connection:
-        """Get or create connection without table initialization."""
+        """Get or create connection without table initialization.
+
+        Retries with backoff to handle Windows file lock delays when a previous
+        process recently closed the database.
+        """
         if self._conn is not None:
             return self._conn
 
-        try:
-            self._conn = await aioduckdb.connect(self._db_path)
-            return self._conn
-        except duckdb.IOException as e:
-            wal_file = Path(self._db_path + '.wal')
-            if wal_file.exists():
-                raise duckdb.IOException(
-                    f"Database is locked. Only one process can access the cache at a time.\n"
-                    f"If no other process is running, delete stale lock files:\n"
-                    f"  rm {self._db_path}.wal*"
-                ) from e
-            raise
+        max_retries = 5
+        base_delay = 0.1  # 100ms initial delay
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                self._conn = await aioduckdb.connect(self._db_path)
+                return self._conn
+            except duckdb.IOException as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    await asyncio.sleep(delay)
+                    continue
+                # Final attempt failed
+                wal_file = Path(self._db_path + '.wal')
+                if wal_file.exists():
+                    raise duckdb.IOException(
+                        f"Database is locked. Only one process can access the cache at a time.\n"
+                        f"If no other process is running, delete stale lock files:\n"
+                        f"  rm {self._db_path}.wal*"
+                    ) from e
+                raise
+
+        # Should not reach here, but just in case
+        raise last_error  # type: ignore
 
     async def _get_conn(self) -> aioduckdb.Connection:
         """Get or create the async DuckDB connection with table initialization."""
@@ -739,4 +733,4 @@ def query(
 
         df = query(SEP, ticker='AAPL', date_gte='2024-01-01', date_lte='2024-12-31')
     """
-    return _run_sync(async_query(table, columns=columns, **filters))
+    return asyncio.run(async_query(table, columns=columns, **filters))
