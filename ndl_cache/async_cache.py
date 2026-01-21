@@ -4,6 +4,7 @@ Async cache layer using aioduckdb for non-blocking DuckDB operations.
 Provides async_query() for async access and query() for sync access.
 """
 import asyncio
+import atexit
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,21 @@ def _run_sync(coro):
     """Run an async coroutine synchronously using the persistent event loop."""
     loop = _get_event_loop()
     return loop.run_until_complete(coro)
+
+
+def _cleanup_event_loop():
+    """Clean up the persistent event loop on process exit.
+
+    This ensures aioduckdb connections are properly closed before the process
+    exits, preventing file lock issues when subprocesses use ndl-cache.
+    """
+    global _event_loop
+    if _event_loop is not None and not _event_loop.is_closed():
+        _event_loop.close()
+        _event_loop = None
+
+
+atexit.register(_cleanup_event_loop)
 
 
 # Lock per table for entire query operations (read-fetch-write cycle).
