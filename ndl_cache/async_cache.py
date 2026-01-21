@@ -559,8 +559,10 @@ class _CacheManager:
         store_df = store_df.drop_duplicates(subset=list(self.table.index_columns))
         rows = [tuple(row) for row in store_df.itertuples(index=False, name=None)]
 
+        # Use INSERT OR REPLACE to handle duplicates from parallel queries or retries.
+        # This prevents constraint errors when overlapping data is fetched multiple times.
         await conn.executemany(f"""
-            INSERT INTO {self.table.safe_table_name()} ({col_names})
+            INSERT OR REPLACE INTO {self.table.safe_table_name()} ({col_names})
             VALUES ({placeholders})
         """, rows)
 
