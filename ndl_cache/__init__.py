@@ -39,6 +39,8 @@ from .async_cache import (
     query,
     async_query,
     get_db_path,
+    validate_sync_bounds,
+    async_validate_sync_bounds,
 )
 
 # Price data multiplexer
@@ -67,6 +69,8 @@ __all__ = [
     'query',
     'async_query',
     'get_db_path',
+    'validate_sync_bounds',
+    'async_validate_sync_bounds',
     # Price data
     'PriceData',
     # Async client

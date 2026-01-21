@@ -304,7 +304,11 @@ class _CacheManager:
         """, [ticker])
 
     async def _check_and_invalidate_stale(self, tickers: list[str]):
-        """Check if cached data is stale and invalidate if needed."""
+        """Check if cached data is stale and invalidate if needed.
+
+        Uses batched API queries to check multiple tickers at once, reducing
+        the number of API calls from N to 1 (or a few batches for large lists).
+        """
         if not tickers:
             return
 
@@ -327,29 +331,37 @@ class _CacheManager:
 
         client = await self._get_ndl_client()
 
-        async def check_ticker(ticker: str) -> tuple[str, bool]:
-            try:
-                df = await client.get_table(
-                    self.table.name,
-                    columns=['lastupdated'],
-                    ticker=ticker,
-                    paginate=False
-                )
-                if len(df) > 0 and 'lastupdated' in df.columns:
-                    api_lastupdated = str(df['lastupdated'].max())[:10]
-                    cached_lastupdated = sync_bounds[ticker].get('max_lastupdated')
-                    is_stale = cached_lastupdated and api_lastupdated > cached_lastupdated
-                    return (ticker, is_stale)
-                return (ticker, False)
-            except Exception:
-                return (ticker, False)
+        # Batch query all tickers at once instead of one API call per ticker
+        try:
+            df = await client.get_table(
+                self.table.name,
+                columns=['ticker', 'lastupdated'],
+                ticker=tickers_to_check,
+                paginate=True
+            )
+        except Exception:
+            # On error, skip staleness check but still update last_staleness_check
+            df = None
 
-        results = await asyncio.gather(*[check_ticker(t) for t in tickers_to_check])
+        # Build map of ticker -> max lastupdated from API response
+        api_lastupdated_map: dict[str, str] = {}
+        if df is not None and len(df) > 0 and 'lastupdated' in df.columns:
+            # Group by ticker and get max lastupdated for each
+            for ticker in df['ticker'].unique():
+                ticker_data = df[df['ticker'] == ticker]
+                max_lu = ticker_data['lastupdated'].max()
+                if pd.notna(max_lu):
+                    api_lastupdated_map[ticker] = str(max_lu)[:10]
 
+        # Compare against cached values to find stale tickers
         stale_tickers = []
-        for ticker, is_stale in results:
-            if is_stale:
+        for ticker in tickers_to_check:
+            api_lastupdated = api_lastupdated_map.get(ticker)
+            cached_lastupdated = sync_bounds[ticker].get('max_lastupdated')
+            if api_lastupdated and cached_lastupdated and api_lastupdated > cached_lastupdated:
                 stale_tickers.append(ticker)
+
+            # Update last_staleness_check for all checked tickers
             await conn.execute(f"""
                 UPDATE {self.table.sync_bounds_table_name()}
                 SET last_staleness_check = ?
@@ -519,28 +531,41 @@ class _CacheManager:
         conn = await self._get_conn()
         queried = await self._fetch_parallel(filter_sets)
 
-        # Extract max_lastupdated per ticker
-        max_lastupdated_by_ticker = {}
-        if len(queried) > 0 and 'lastupdated' in queried.columns:
+        # Extract actual date ranges and max_lastupdated per ticker from returned data
+        # This ensures sync bounds reflect what was actually stored, not what was requested
+        ticker_stats: dict[str, dict] = {}
+        if len(queried) > 0:
+            date_col = self.table.date_column
             for ticker in queried['ticker'].unique():
                 ticker_data = queried[queried['ticker'] == ticker]
-                max_lu = ticker_data['lastupdated'].max()
-                if pd.notna(max_lu):
-                    max_lastupdated_by_ticker[ticker] = str(max_lu)[:10]
+                stats: dict = {}
 
-        # Update sync bounds
-        today = datetime.now().strftime('%Y-%m-%d')
-        for filters in filter_sets:
-            ticker = filters.get('ticker')
-            if ticker:
-                tickers = ticker if isinstance(ticker, list) else [ticker]
-                for t in tickers:
-                    if self.table.date_column is None:
-                        await self._mark_ticker_synced(t, max_lastupdated_by_ticker.get(t))
-                    else:
-                        date_gte = filters.get(f'{self.table.date_column}_gte', '1900-01-01')
-                        date_lte = filters.get(f'{self.table.date_column}_lte', today)
-                        await self._update_sync_bounds(t, date_gte, date_lte, max_lastupdated_by_ticker.get(t))
+                if 'lastupdated' in ticker_data.columns:
+                    max_lu = ticker_data['lastupdated'].max()
+                    if pd.notna(max_lu):
+                        stats['max_lastupdated'] = str(max_lu)[:10]
+
+                if date_col and date_col in ticker_data.columns:
+                    min_date = ticker_data[date_col].min()
+                    max_date = ticker_data[date_col].max()
+                    if pd.notna(min_date) and pd.notna(max_date):
+                        stats['min_date'] = str(min_date)[:10]
+                        stats['max_date'] = str(max_date)[:10]
+
+                if stats:
+                    ticker_stats[ticker] = stats
+
+        # Update sync bounds based on ACTUAL data received, not requested ranges
+        for ticker, stats in ticker_stats.items():
+            if self.table.date_column is None:
+                await self._mark_ticker_synced(ticker, stats.get('max_lastupdated'))
+            else:
+                min_date = stats.get('min_date')
+                max_date = stats.get('max_date')
+                if min_date and max_date:
+                    await self._update_sync_bounds(
+                        ticker, min_date, max_date, stats.get('max_lastupdated')
+                    )
 
         if len(queried) == 0:
             return 0
@@ -622,6 +647,47 @@ class _CacheManager:
 
         return df
 
+    def _find_tickers_with_gaps(self, df: pd.DataFrame, gap_threshold_days: int = 14) -> list[str]:
+        """Find tickers with date gaps larger than threshold in cached data.
+
+        This is a quick check on already-loaded data to detect corrupted cache entries.
+        """
+        if df.empty or self.table.date_column is None:
+            return []
+
+        date_col = self.table.date_column
+        if date_col not in df.index.names:
+            return []
+
+        tickers_with_gaps = []
+
+        # Get unique tickers from the index
+        if 'ticker' in df.index.names:
+            ticker_level = df.index.names.index('ticker')
+            unique_tickers = df.index.get_level_values(ticker_level).unique()
+
+            for ticker in unique_tickers:
+                try:
+                    ticker_data = df.loc[ticker] if ticker_level == 0 else df.xs(ticker, level='ticker')
+                    if isinstance(ticker_data, pd.Series):
+                        continue  # Only one row, no gaps possible
+
+                    dates = ticker_data.index.get_level_values(date_col) if date_col in ticker_data.index.names else None
+                    if dates is None or len(dates) < 2:
+                        continue
+
+                    # Sort dates and check for gaps
+                    sorted_dates = sorted(dates)
+                    for i in range(1, len(sorted_dates)):
+                        gap = (sorted_dates[i] - sorted_dates[i-1]).days
+                        if gap > gap_threshold_days:
+                            tickers_with_gaps.append(ticker)
+                            break
+                except (KeyError, TypeError):
+                    continue
+
+        return tickers_with_gaps
+
     async def query(self, columns: list[str] | str | None = None, **filters) -> pd.DataFrame:
         """Query data from cache, fetching from NDL if not cached."""
         ticker_filter = filters.get('ticker')
@@ -673,6 +739,28 @@ class _CacheManager:
                         await self._sync_parallel([{'ticker': t} for t in unsynced])
 
             result = await self.get_cached(**filters)
+
+            # Quick gap check: if any tickers have large date gaps, invalidate and re-fetch
+            if not result.empty and self.table.date_column:
+                tickers_with_gaps = self._find_tickers_with_gaps(result)
+                if tickers_with_gaps:
+                    # Invalidate corrupted tickers and re-fetch
+                    for ticker in tickers_with_gaps:
+                        await self._invalidate_ticker(ticker)
+
+                    # Re-run sync for the corrupted tickers
+                    date_gte = filters.get(f'{self.table.date_column}_gte')
+                    date_lte = filters.get(f'{self.table.date_column}_lte')
+                    if date_gte and date_lte:
+                        refetch_filters = [{
+                            'ticker': tickers_with_gaps,
+                            f'{self.table.date_column}_gte': date_gte,
+                            f'{self.table.date_column}_lte': date_lte,
+                        }]
+                        await self._sync_parallel(refetch_filters)
+
+                    # Re-fetch from cache
+                    result = await self.get_cached(**filters)
 
         if len(result) == 0:
             return pd.DataFrame()
@@ -736,3 +824,136 @@ def query(
         df = query(SEP, ticker='AAPL', date_gte='2024-01-01', date_lte='2024-12-31')
     """
     return asyncio.run(async_query(table, columns=columns, **filters))
+
+
+async def async_validate_sync_bounds(
+    table: TableDef,
+    fix: bool = False,
+    gap_threshold_days: int = 14,
+) -> list[dict]:
+    """
+    Validate sync bounds against actual cached data for a table.
+
+    Detects sync bounds that claim a date range but the actual data is missing,
+    has gaps, or doesn't match the claimed range.
+
+    Args:
+        table: Table definition (e.g., SEP, SFP)
+        fix: If True, clear corrupted sync bounds so data will be re-fetched
+        gap_threshold_days: Report gaps larger than this many days
+
+    Returns:
+        List of dicts describing issues found:
+        [{'ticker': 'VT', 'issue': 'no_data', 'details': '...'}, ...]
+
+    Example:
+        from ndl_cache import SFP, async_validate_sync_bounds
+
+        issues = await async_validate_sync_bounds(SFP, fix=True)
+        for issue in issues:
+            print(f"{issue['ticker']}: {issue['issue']}")
+    """
+    import duckdb
+
+    db_path = get_db_path()
+    conn = duckdb.connect(db_path)
+    issues = []
+
+    try:
+        # Check if tables exist
+        data_table = table.safe_table_name()
+        sync_table = table.sync_bounds_table_name()
+
+        tables_exist = conn.execute(f"""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_name IN ('{data_table}', '{sync_table}')
+        """).fetchone()[0]
+
+        if tables_exist < 2:
+            return []  # Tables don't exist yet
+
+        # Get all sync bounds
+        sync_bounds = conn.execute(f"""
+            SELECT ticker, synced_from, synced_to
+            FROM {sync_table}
+        """).fetchall()
+
+        date_col = table.date_column
+        if date_col is None:
+            return []  # Non-date tables don't have this issue
+
+        for ticker, synced_from, synced_to in sync_bounds:
+            # Get actual data range for this ticker
+            result = conn.execute(f"""
+                SELECT MIN({date_col}), MAX({date_col}), COUNT(*)
+                FROM {data_table}
+                WHERE ticker = ?
+            """, [ticker]).fetchone()
+
+            actual_min, actual_max, actual_count = result
+
+            issue = None
+
+            if actual_count == 0:
+                issue = {
+                    'ticker': ticker,
+                    'issue': 'no_data',
+                    'details': f'Sync bounds claim {synced_from} to {synced_to} but no data exists',
+                }
+            else:
+                # Check for start mismatch (actual data starts later than claimed)
+                if synced_from and actual_min:
+                    synced_from_str = str(synced_from)[:10]
+                    actual_min_str = str(actual_min)[:10]
+                    if actual_min_str > synced_from_str:
+                        from datetime import datetime
+                        gap = (datetime.strptime(actual_min_str, '%Y-%m-%d') -
+                               datetime.strptime(synced_from_str, '%Y-%m-%d')).days
+                        if gap > gap_threshold_days:
+                            issue = {
+                                'ticker': ticker,
+                                'issue': 'start_gap',
+                                'details': f'Data starts at {actual_min_str} but sync claims {synced_from_str} (gap: {gap} days)',
+                            }
+
+                # Check for end mismatch (claimed end is later than actual data)
+                if not issue and synced_to and actual_max:
+                    synced_to_str = str(synced_to)[:10]
+                    actual_max_str = str(actual_max)[:10]
+                    if synced_to_str > actual_max_str:
+                        from datetime import datetime
+                        gap = (datetime.strptime(synced_to_str, '%Y-%m-%d') -
+                               datetime.strptime(actual_max_str, '%Y-%m-%d')).days
+                        if gap > gap_threshold_days:
+                            issue = {
+                                'ticker': ticker,
+                                'issue': 'end_gap',
+                                'details': f'Data ends at {actual_max_str} but sync claims {synced_to_str} (gap: {gap} days)',
+                            }
+
+            if issue:
+                issues.append(issue)
+
+                if fix:
+                    # Clear sync bounds and data so it will be re-fetched
+                    conn.execute(f"DELETE FROM {sync_table} WHERE ticker = ?", [ticker])
+                    conn.execute(f"DELETE FROM {data_table} WHERE ticker = ?", [ticker])
+                    issue['fixed'] = True
+
+    finally:
+        conn.close()
+
+    return issues
+
+
+def validate_sync_bounds(
+    table: TableDef,
+    fix: bool = False,
+    gap_threshold_days: int = 14,
+) -> list[dict]:
+    """
+    Validate sync bounds against actual cached data for a table (sync version).
+
+    See async_validate_sync_bounds for details.
+    """
+    return asyncio.run(async_validate_sync_bounds(table, fix=fix, gap_threshold_days=gap_threshold_days))
