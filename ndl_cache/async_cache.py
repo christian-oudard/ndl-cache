@@ -31,6 +31,14 @@ NDL_PAGE_LIMIT = 10000
 # Split threshold - stay well under page limit
 NDL_SPLIT_THRESHOLD = 9000
 
+# Requests are also bounded by URL length, independently of row count. A query
+# for one date across a thousand tickers returns almost no rows but builds a
+# ticker parameter of several kilobytes; Nasdaq answered a 10,032 character URL
+# with 414 and an HTML error page, which surfaced as a bare "API request
+# failed". Most servers cap the request line near 8 KB, so budget the ticker
+# list well under that to leave room for the other parameters.
+MAX_TICKER_PARAM_CHARS = 3000
+
 # Lock per table for entire query operations (read-fetch-write cycle).
 #
 # Problem: asyncio.run() creates a new event loop and closes it after each call.
@@ -397,14 +405,23 @@ class _CacheManager:
         )
         return n_tickers * est_rows_per_ticker
 
+    @staticmethod
+    def _ticker_param_too_long(ticker) -> bool:
+        """Whether a ticker filter would overflow the URL on its own."""
+        if not isinstance(ticker, list) or len(ticker) <= 1:
+            return False
+        return len(','.join(ticker)) > MAX_TICKER_PARAM_CHARS
+
+    @staticmethod
+    def _tickers_per_url(ticker: list[str]) -> int:
+        """How many tickers fit in one URL, using the longest as the estimate."""
+        longest = max(len(t) for t in ticker)
+        return max(1, MAX_TICKER_PARAM_CHARS // (longest + 1))
+
     def _split_filters(self, filters: dict, max_rows: int = NDL_SPLIT_THRESHOLD) -> list[dict]:
         """Split a filter set into chunks that each return < max_rows."""
         # Skip splitting for tables with unknown row density (e.g., sparse ACTIONS table)
         if self.table.rows_per_year is None:
-            return [filters]
-
-        est_rows = self._estimate_rows(filters)
-        if est_rows < max_rows:
             return [filters]
 
         date_col = self.table.date_column
@@ -412,10 +429,19 @@ class _CacheManager:
         date_gte = filters.get(f'{date_col}_gte')
         date_lte = filters.get(f'{date_col}_lte')
 
+        est_rows = self._estimate_rows(filters)
+        # A request can be small in rows and still too long as a URL, so the
+        # ticker parameter has to be checked before taking the early exit.
+        if est_rows < max_rows and not self._ticker_param_too_long(ticker):
+            return [filters]
+
         # Strategy 1: Split by tickers
         if isinstance(ticker, list) and len(ticker) > 1:
             est_rows_per_ticker = self._estimate_rows_for_range(date_gte, date_lte)
             tickers_per_chunk = max(1, max_rows // est_rows_per_ticker)
+            # Whichever limit binds first, rows or URL length.
+            tickers_per_chunk = min(
+                tickers_per_chunk, self._tickers_per_url(ticker))
 
             chunks = []
             for i in range(0, len(ticker), tickers_per_chunk):

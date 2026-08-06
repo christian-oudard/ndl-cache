@@ -165,3 +165,33 @@ class TestProxySupport:
             assert session._trust_env is True
         finally:
             await client.close()
+
+
+class TestErrorDetail:
+    """
+    An error the caller cannot act on is nearly as bad as no error. A 414
+    comes back as an HTML page rather than the usual JSON envelope, and used
+    to surface as "API request failed" with no status at all.
+    """
+
+    def test_non_json_body_still_reports_the_status(self):
+        with pytest.raises(NDLError) as caught:
+            _raise_for_error(414, None, '<html>Request-URI Too Long</html>')
+        assert '414' in str(caught.value)
+        assert caught.value.http_status == 414
+
+    def test_414_explains_what_to_do(self):
+        with pytest.raises(NDLError) as caught:
+            _raise_for_error(414, None, 'Request-URI Too Long')
+        assert 'URI too long' in str(caught.value)
+
+    def test_long_bodies_are_truncated(self):
+        with pytest.raises(NDLError) as caught:
+            _raise_for_error(500, None, 'x' * 5000)
+        assert len(str(caught.value)) < 400
+
+    def test_json_error_message_still_preferred(self):
+        with pytest.raises(NDLError) as caught:
+            _raise_for_error(400, {'quandl_error': {
+                'code': 'QEMx01', 'message': 'Something specific'}}, 'ignored')
+        assert 'Something specific' in str(caught.value)

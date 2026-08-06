@@ -81,15 +81,34 @@ def _is_authentication(message: str) -> bool:
     return 'api key' in lowered or 'unauthor' in lowered or 'subscription' in lowered
 
 
-def _raise_for_error(status: int, data: dict | None = None):
-    """Raise appropriate exception based on HTTP status and response."""
-    message = "API request failed"
+def _raise_for_error(status: int, data: dict | None = None,
+                     body: str | None = None):
+    """
+    Raise the appropriate exception for an HTTP status and response.
+
+    ``body`` is the raw response text, used when the server answers with
+    something other than the usual JSON error envelope. A 414 comes back as an
+    HTML error page, and without this the only report was "API request failed"
+    with no status, which says nothing about what to fix.
+    """
+    message = None
     code = None
 
     if data and "quandl_error" in data:
         error_info = data["quandl_error"]
-        message = error_info.get("message", message)
+        message = error_info.get("message")
         code = error_info.get("code")
+
+    if not message:
+        detail = (body or '').strip()
+        if len(detail) > 200:
+            detail = detail[:200] + '...'
+        message = f'HTTP {status}'
+        if status == 414:
+            message += (' URI too long: the request URL exceeded the server '
+                        'limit, so the query needs splitting into more chunks')
+        if detail:
+            message += f': {detail}'
 
     if status == 429 or _is_rate_limit(message):
         raise RateLimitError(message, status, code)
@@ -200,12 +219,17 @@ class AsyncNDLClient:
                 async with self.rate_limiter.in_flight():
                     async with session.get(url, params=params) as resp:
                         if resp.status >= 400:
+                            body = None
                             try:
                                 data = await resp.json()
                             except Exception:
                                 data = None
+                                try:
+                                    body = await resp.text()
+                                except Exception:
+                                    body = None
                             try:
-                                _raise_for_error(resp.status, data)
+                                _raise_for_error(resp.status, data, body)
                             except RateLimitError:
                                 # Honour Retry-After when sent, and stand the
                                 # whole client down either way. Nasdaq suspends

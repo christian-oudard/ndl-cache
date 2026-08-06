@@ -11,8 +11,10 @@ import aioduckdb
 import pandas as pd
 import pytest
 
-from ndl_cache import SEP, query, async_query
-from ndl_cache.async_cache import get_db_path, _CacheManager, NDL_SPLIT_THRESHOLD
+from ndl_cache import SEP, DAILY, query, async_query
+from ndl_cache.async_cache import (
+    get_db_path, _CacheManager, NDL_SPLIT_THRESHOLD, MAX_TICKER_PARAM_CHARS,
+)
 from ndl_cache.async_client import AsyncNDLClient
 from ndl_cache.testing import temp_db
 
@@ -773,3 +775,62 @@ class TestConcurrentAccess:
                     race_errors.append(f"Query {i} ({tickers[i]}): {result}")
 
         assert not race_errors, f"Race condition errors:\n" + "\n".join(race_errors)
+
+
+class TestUrlLengthSplitting:
+    """
+    Splitting has to respect URL length, not just row count.
+
+    A single-date query over a thousand tickers returns few rows but builds a
+    ticker parameter of many kilobytes. Nasdaq answered a 10,032 character URL
+    with 414 and an unparseable error page, which surfaced as a bare
+    "API request failed".
+    """
+
+    @pytest.fixture
+    def mgr(self):
+        with temp_db():
+            yield _CacheManager(DAILY)
+
+    def _ticker_chars(self, chunk):
+        ticker = chunk['ticker']
+        if isinstance(ticker, list):
+            return len(','.join(ticker))
+        return len(ticker)
+
+    def test_wide_single_date_query_is_split(self, mgr):
+        # 1,500 tickers on one date: well under the row limit, far over the
+        # URL limit. This is the shape that failed.
+        tickers = [f'TICK{i:04d}' for i in range(1500)]
+        filters = {'ticker': tickers,
+                   'date_gte': '2024-01-31', 'date_lte': '2024-01-31'}
+        chunks = mgr._split_filters(filters)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert self._ticker_chars(chunk) <= MAX_TICKER_PARAM_CHARS
+
+    def test_every_ticker_survives_the_split(self, mgr):
+        tickers = [f'TICK{i:04d}' for i in range(1500)]
+        filters = {'ticker': tickers,
+                   'date_gte': '2024-01-31', 'date_lte': '2024-01-31'}
+        chunks = mgr._split_filters(filters)
+        seen = []
+        for chunk in chunks:
+            t = chunk['ticker']
+            seen.extend(t if isinstance(t, list) else [t])
+        assert sorted(seen) == sorted(tickers)
+
+    def test_small_ticker_list_still_not_split(self, mgr):
+        filters = {'ticker': ['AAPL', 'MSFT'],
+                   'date_gte': '2024-01-31', 'date_lte': '2024-01-31'}
+        assert len(mgr._split_filters(filters)) == 1
+
+    def test_row_based_split_also_respects_url_length(self, mgr):
+        # Enough tickers and days to trip both limits at once.
+        tickers = [f'TICK{i:04d}' for i in range(1500)]
+        filters = {'ticker': tickers,
+                   'date_gte': '2024-01-01', 'date_lte': '2024-12-31'}
+        chunks = mgr._split_filters(filters)
+        for chunk in chunks:
+            assert self._ticker_chars(chunk) <= MAX_TICKER_PARAM_CHARS
+            assert mgr._estimate_rows(chunk) < NDL_SPLIT_THRESHOLD
