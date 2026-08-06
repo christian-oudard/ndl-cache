@@ -136,7 +136,7 @@ TICKERS = TableDef(
     date_column=None,  # No date-based sync
     query_columns=(
         'name', 'exchange', 'category', 'cusips', 'siccode', 'sicsector',
-        'sicindustry', 'famasector', 'famaindustry', 'sector', 'industry',
+        'sicindustry', 'famaindustry', 'sector', 'industry',
         'scalemarketcap', 'scalerevenue', 'currency', 'location', 'lastupdated',
         'firstadded', 'firstpricedate', 'lastpricedate', 'firstquarter',
         'lastquarter', 'secfilings', 'companysite', 'isdelisted', 'permaticker',
@@ -150,7 +150,6 @@ TICKERS = TableDef(
         'siccode': 'VARCHAR',
         'sicsector': 'VARCHAR',
         'sicindustry': 'VARCHAR',
-        'famasector': 'VARCHAR',
         'famaindustry': 'VARCHAR',
         'sector': 'VARCHAR',
         'industry': 'VARCHAR',

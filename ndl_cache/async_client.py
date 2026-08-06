@@ -13,6 +13,8 @@ from typing import Any
 import aiohttp
 import pandas as pd
 
+from ndl_cache.rate_limit import RateLimiter, parse_retry_after
+
 
 class NDLError(Exception):
     """Base exception for Nasdaq Data Link errors."""
@@ -61,6 +63,24 @@ def _get_api_key() -> str | None:
     return None
 
 
+def _is_rate_limit(message: str) -> bool:
+    """
+    Whether an error body describes a rate limit rather than a bad credential.
+
+    Nasdaq reports the speed limit with more than one HTTP status, and the
+    403 form is indistinguishable from a rejected key by status alone.
+    """
+    lowered = message.lower()
+    return 'speed limit' in lowered or 'rate limit' in lowered or (
+        'exceeded' in lowered and 'limit' in lowered)
+
+
+def _is_authentication(message: str) -> bool:
+    """Whether a 401/403 body is really about the credential."""
+    lowered = message.lower()
+    return 'api key' in lowered or 'unauthor' in lowered or 'subscription' in lowered
+
+
 def _raise_for_error(status: int, data: dict | None = None):
     """Raise appropriate exception based on HTTP status and response."""
     message = "API request failed"
@@ -71,13 +91,17 @@ def _raise_for_error(status: int, data: dict | None = None):
         message = error_info.get("message", message)
         code = error_info.get("code")
 
-    if status == 401 or status == 403:
-        raise AuthenticationError(message, status, code)
+    if status == 429 or _is_rate_limit(message):
+        raise RateLimitError(message, status, code)
     elif status == 404:
         raise NotFoundError(message, status, code)
-    elif status == 429:
-        raise RateLimitError(message, status, code)
+    elif (status == 401 or status == 403) and _is_authentication(message):
+        raise AuthenticationError(message, status, code)
     else:
+        # Nasdaq answers some request errors with 403 even when the credential
+        # is fine, notably a query naming a column the table no longer has.
+        # Reporting those as an auth failure sends the reader off checking keys
+        # and proxies for what is really a stale schema in this package.
         raise NDLError(message, status, code)
 
 
@@ -105,6 +129,7 @@ class AsyncNDLClient:
         api_key: str | None = None,
         timeout: float | None = None,
         max_retries: int | None = None,
+        rate_limiter: "RateLimiter | None" = None,
     ):
         """
         Initialize the async client.
@@ -117,6 +142,9 @@ class AsyncNDLClient:
         self.api_key = api_key or _get_api_key()
         self.timeout = timeout or self.DEFAULT_TIMEOUT
         self.max_retries = max_retries if max_retries is not None else self.MAX_RETRIES
+        # Shared across this client's concurrent fetchers, so one rejection
+        # stands the whole client down instead of only the worker that saw it.
+        self.rate_limiter = rate_limiter or RateLimiter()
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -130,7 +158,18 @@ class AsyncNDLClient:
                 headers["x-api-token"] = self.api_key
 
             timeout = aiohttp.ClientTimeout(total=self.timeout)
-            self._session = aiohttp.ClientSession(headers=headers, timeout=timeout)
+            # trust_env makes aiohttp honour HTTP_PROXY/HTTPS_PROXY/NO_PROXY
+            # and .netrc, which requests does by default and aiohttp does not.
+            # Without it, every call bypasses any configured proxy. Where a
+            # proxy supplies the credential, the request then goes out with
+            # whatever placeholder is on disk, and Nasdaq answers as if the
+            # caller were anonymous: the anonymous pool is 20 calls per 10
+            # minutes shared across all anonymous users, so it is permanently
+            # exhausted and the reply is a rate-limit error. That error is
+            # deeply misleading, since the rate is fine and the credential is
+            # the problem.
+            self._session = aiohttp.ClientSession(
+                headers=headers, timeout=timeout, trust_env=True)
 
         return self._session
 
@@ -151,21 +190,35 @@ class AsyncNDLClient:
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
+            # Pace before every attempt, including retries, so a burst of
+            # parallel fetchers cannot collectively outrun the limit.
+            await self.rate_limiter.acquire()
             try:
-                async with session.get(url, params=params) as resp:
-                    if resp.status >= 400:
-                        try:
-                            data = await resp.json()
-                        except Exception:
-                            data = None
-                        _raise_for_error(resp.status, data)
+                # The slot is held for the whole request, not just its start.
+                # Nasdaq's concurrency limit counts calls that are open, so
+                # releasing at send time would let several overlap.
+                async with self.rate_limiter.in_flight():
+                    async with session.get(url, params=params) as resp:
+                        if resp.status >= 400:
+                            try:
+                                data = await resp.json()
+                            except Exception:
+                                data = None
+                            try:
+                                _raise_for_error(resp.status, data)
+                            except RateLimitError:
+                                # Honour Retry-After when sent, and stand the
+                                # whole client down either way. Nasdaq suspends
+                                # the account rather than throttling, so the old
+                                # sub-second backoff just extended the ban.
+                                self.rate_limiter.penalize(
+                                    parse_retry_after(resp.headers))
+                                raise
 
-                    return await resp.json()
+                        return await resp.json()
 
             except RateLimitError:
                 if attempt < self.max_retries:
-                    wait_time = self.RETRY_BACKOFF * (2 ** attempt)
-                    await asyncio.sleep(wait_time)
                     continue
                 raise
 

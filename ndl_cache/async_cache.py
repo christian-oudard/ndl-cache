@@ -19,7 +19,11 @@ from .tables import TableDef, TRADING_DAYS_PER_YEAR
 
 
 # Optimal parallelization level based on benchmarking ~10k row requests
-MAX_FETCH_WORKERS = 4
+# Nasdaq's Tables API allows an authenticated key one call in flight plus one
+# queued, so extra workers cannot make progress and only risk tripping the
+# concurrency limit. The client's rate limiter enforces this with a semaphore;
+# this bound just avoids queueing work that can never run in parallel.
+MAX_FETCH_WORKERS = int(os.environ.get('NDL_MAX_CONCURRENCY', 2))
 
 # NDL API page limit
 NDL_PAGE_LIMIT = 10000
