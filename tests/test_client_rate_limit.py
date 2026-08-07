@@ -258,3 +258,83 @@ class TestServerErrorRetry:
         await client._request('http://example/x')
         assert clock.slept == [pytest.approx(client.RETRY_BACKOFF),
                                pytest.approx(client.RETRY_BACKOFF * 2)]
+
+
+class TestConnectionFailureRetry:
+    """
+    Two multi-hour runs died on network faults: one on a dropped connection
+    whose retries all failed within two seconds, and one on a request timeout
+    that was never retried at all because asyncio.TimeoutError is not an
+    aiohttp error.
+    """
+
+    class FailingSession(FakeSession):
+        """Raises a given exception for the first n calls."""
+
+        def __init__(self, error, failures):
+            super().__init__([])
+            self._error = error
+            self._failures = failures
+            self.closed = False
+
+        def get(self, url, params=None):
+            self.calls += 1
+            if self.calls <= self._failures:
+                raise self._error
+            return FakeResponse(200, {'datatable': {'data': []}})
+
+        async def close(self):
+            self.closed = True
+
+    async def _client(self, session, clock):
+        limiter = RateLimiter(windows=[Window(calls=100, seconds=10)],
+                              clock=clock.time, sleep=clock.sleep)
+        client = AsyncNDLClient(api_key='x', rate_limiter=limiter)
+        client._session = session
+        return client
+
+    async def test_a_request_timeout_is_retried(self):
+        import asyncio
+        clock = FakeClock()
+        session = self.FailingSession(asyncio.TimeoutError(), 1)
+        client = await self._client(session, clock)
+        # A fresh session is created after the failure, so keep serving the
+        # same fake rather than letting aiohttp build a real one.
+        client._get_session = lambda: _identity(session)
+        await client._request('http://example/x')
+        assert session.calls == 2
+
+    async def test_a_dropped_connection_is_retried(self):
+        import aiohttp
+        clock = FakeClock()
+        session = self.FailingSession(
+            aiohttp.ServerDisconnectedError(), 2)
+        client = await self._client(session, clock)
+        client._get_session = lambda: _identity(session)
+        await client._request('http://example/x')
+        assert session.calls == 3
+
+    async def test_the_stale_session_is_discarded(self):
+        # Reusing a pool holding a dead socket fails identically every time,
+        # which spends all the retries without ever trying a live connection.
+        import aiohttp
+        clock = FakeClock()
+        session = self.FailingSession(aiohttp.ServerDisconnectedError(), 1)
+        client = await self._client(session, clock)
+        client._get_session = lambda: _identity(session)
+        await client._request('http://example/x')
+        assert session.closed
+
+    async def test_connection_retries_wait_longer_than_server_errors(self):
+        import aiohttp
+        clock = FakeClock()
+        session = self.FailingSession(aiohttp.ServerDisconnectedError(), 1)
+        client = await self._client(session, clock)
+        client._get_session = lambda: _identity(session)
+        await client._request('http://example/x')
+        assert clock.slept == [pytest.approx(client.CONNECTION_BACKOFF)]
+        assert client.CONNECTION_BACKOFF > client.RETRY_BACKOFF
+
+
+async def _identity(value):
+    return value

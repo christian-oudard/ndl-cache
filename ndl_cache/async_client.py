@@ -141,6 +141,11 @@ class AsyncNDLClient:
     DEFAULT_TIMEOUT = 30.0
     MAX_RETRIES = 3
     RETRY_BACKOFF = 0.5
+    # Connection failures get a longer wait than server errors. A dropped
+    # connection usually means a brief outage rather than one bad request,
+    # and retrying within two seconds just spends the attempts before it
+    # clears.
+    CONNECTION_BACKOFF = 5.0
     PAGE_LIMIT = 100
 
     def __init__(
@@ -262,11 +267,22 @@ class AsyncNDLClient:
                     continue
                 raise
 
-            except aiohttp.ClientError as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # asyncio.TimeoutError is deliberately included: a total
+                # request timeout raises it rather than an aiohttp error, so
+                # it was not retried at all and one slow response killed a
+                # multi-hour run.
                 last_error = e
+                # A dropped or timed-out connection can leave a dead socket
+                # in the pool, and reusing it fails the same way every time,
+                # which turns three retries into three instant failures.
+                # Starting a fresh session costs little beside a retry that
+                # was going to fail.
+                await self.close()
                 if attempt < self.max_retries:
                     await self.rate_limiter.sleep(
-                        self.RETRY_BACKOFF * (2 ** attempt))
+                        self.CONNECTION_BACKOFF * (2 ** attempt))
+                    session = await self._get_session()
                     continue
                 raise NDLError(f"Request failed: {e}") from e
 
