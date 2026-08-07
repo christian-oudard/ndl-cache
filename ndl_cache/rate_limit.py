@@ -154,6 +154,17 @@ class RateLimiter:
         self._lock = asyncio.Lock()
         self._slots = asyncio.Semaphore(max_concurrency)
 
+    async def sleep(self, seconds):
+        """
+        Wait, using this limiter's clock.
+
+        Retry backoff goes through here so that every wait in the client is
+        driven by one injectable clock. Reaching the real asyncio.sleep for
+        some waits and not others makes tests both slow and unable to assert
+        on how long the client actually waited.
+        """
+        await self._sleep(seconds)
+
     def in_flight(self):
         """
         Context manager holding one concurrency slot for the duration of a

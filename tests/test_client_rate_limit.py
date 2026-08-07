@@ -195,3 +195,66 @@ class TestErrorDetail:
             _raise_for_error(400, {'quandl_error': {
                 'code': 'QEMx01', 'message': 'Something specific'}}, 'ignored')
         assert 'Something specific' in str(caught.value)
+
+
+class TestServerErrorRetry:
+    """
+    Nasdaq intermittently answers a valid request with a 5xx and a generic
+    "unexpected error in the system". Treating that as fatal loses the rest
+    of a long sync, which is how a cache warm-up died partway through.
+    """
+
+    SERVER_ERROR = {
+        'quandl_error': {
+            'code': 'QEMx01',
+            'message': ("We're sorry, but there's been an unexpected error "
+                        "in the system."),
+        }
+    }
+
+    BAD_REQUEST = {
+        'quandl_error': {
+            'code': 'QEPx06',
+            'message': '["famasector"] column does not exist.',
+        }
+    }
+
+    async def _client(self, responses, clock):
+        limiter = RateLimiter(windows=[Window(calls=100, seconds=10)],
+                              clock=clock.time, sleep=clock.sleep)
+        client = AsyncNDLClient(api_key='x', rate_limiter=limiter)
+        client._session = FakeSession(responses)
+        return client, client._session
+
+    async def test_a_transient_server_error_is_retried(self):
+        clock = FakeClock()
+        client, session = await self._client(
+            [FakeResponse(500, self.SERVER_ERROR)], clock)
+        await client._request('http://example/x')
+        assert session.calls == 2
+
+    async def test_a_persistent_server_error_eventually_raises(self):
+        clock = FakeClock()
+        client, session = await self._client(
+            [FakeResponse(500, self.SERVER_ERROR) for _ in range(10)], clock)
+        with pytest.raises(NDLError):
+            await client._request('http://example/x')
+        assert session.calls == client.max_retries + 1
+
+    async def test_a_bad_request_is_not_retried(self):
+        # A malformed query fails the same way however often it is sent, so
+        # retrying only multiplies the load and delays the real error.
+        clock = FakeClock()
+        client, session = await self._client(
+            [FakeResponse(403, self.BAD_REQUEST) for _ in range(10)], clock)
+        with pytest.raises(NDLError):
+            await client._request('http://example/x')
+        assert session.calls == 1
+
+    async def test_retries_back_off(self):
+        clock = FakeClock()
+        client, _ = await self._client(
+            [FakeResponse(503, self.SERVER_ERROR) for _ in range(2)], clock)
+        await client._request('http://example/x')
+        assert clock.slept == [pytest.approx(client.RETRY_BACKOFF),
+                               pytest.approx(client.RETRY_BACKOFF * 2)]

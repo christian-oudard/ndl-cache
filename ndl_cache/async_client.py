@@ -246,11 +246,27 @@ class AsyncNDLClient:
                     continue
                 raise
 
+            except NDLError as e:
+                # Nasdaq answers occasionally with a 5xx and a generic
+                # "unexpected error in the system". It is transient and the
+                # same request succeeds shortly after, but it was fatal here,
+                # so a long sync would die partway through and lose the rest
+                # of its work. Retry those; leave 4xx alone, since a bad
+                # request will fail the same way however often it is sent.
+                if e.http_status is None or e.http_status < 500:
+                    raise
+                last_error = e
+                if attempt < self.max_retries:
+                    await self.rate_limiter.sleep(
+                        self.RETRY_BACKOFF * (2 ** attempt))
+                    continue
+                raise
+
             except aiohttp.ClientError as e:
                 last_error = e
                 if attempt < self.max_retries:
-                    wait_time = self.RETRY_BACKOFF * (2 ** attempt)
-                    await asyncio.sleep(wait_time)
+                    await self.rate_limiter.sleep(
+                        self.RETRY_BACKOFF * (2 ** attempt))
                     continue
                 raise NDLError(f"Request failed: {e}") from e
 
