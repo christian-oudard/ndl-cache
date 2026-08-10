@@ -314,16 +314,31 @@ class TestConnectionFailureRetry:
         await client._request('http://example/x')
         assert session.calls == 3
 
-    async def test_the_stale_session_is_discarded(self):
-        # Reusing a pool holding a dead socket fails identically every time,
-        # which spends all the retries without ever trying a live connection.
+    async def test_the_shared_session_is_not_closed(self):
+        # The session is shared by every concurrent fetch. Closing it on one
+        # failure raises "Session is closed" in all of its siblings, turning
+        # a single timeout into a failed batch. This was a real regression:
+        # it killed a historical sync partway through.
         import aiohttp
         clock = FakeClock()
         session = self.FailingSession(aiohttp.ServerDisconnectedError(), 1)
         client = await self._client(session, clock)
         client._get_session = lambda: _identity(session)
         await client._request('http://example/x')
-        assert session.closed
+        assert not session.closed
+
+    async def test_concurrent_requests_survive_one_failing(self):
+        # One request timing out must not break the others sharing the
+        # session, which is what asyncio.gather over chunks relies on.
+        import asyncio
+        clock = FakeClock()
+        session = self.FailingSession(asyncio.TimeoutError(), 1)
+        client = await self._client(session, clock)
+        client._get_session = lambda: _identity(session)
+        results = await asyncio.gather(
+            *[client._request(f'http://example/{i}') for i in range(4)])
+        assert len(results) == 4
+        assert not session.closed
 
     async def test_connection_retries_wait_longer_than_server_errors(self):
         import aiohttp

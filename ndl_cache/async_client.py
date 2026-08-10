@@ -273,16 +273,15 @@ class AsyncNDLClient:
                 # it was not retried at all and one slow response killed a
                 # multi-hour run.
                 last_error = e
-                # A dropped or timed-out connection can leave a dead socket
-                # in the pool, and reusing it fails the same way every time,
-                # which turns three retries into three instant failures.
-                # Starting a fresh session costs little beside a retry that
-                # was going to fail.
-                await self.close()
+                # The session is deliberately not recycled here. It is shared
+                # by every concurrent fetch, so closing it on one failure
+                # raises "Session is closed" in all of its siblings and turns
+                # one timeout into a failed batch. aiohttp's connector already
+                # discards connections that error, which is the part that
+                # actually needed handling.
                 if attempt < self.max_retries:
                     await self.rate_limiter.sleep(
                         self.CONNECTION_BACKOFF * (2 ** attempt))
-                    session = await self._get_session()
                     continue
                 raise NDLError(f"Request failed: {e}") from e
 
