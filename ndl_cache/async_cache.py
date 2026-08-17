@@ -211,7 +211,12 @@ class _CacheManager:
             await self._get_conn_without_init()
             # Creating the bookkeeping table is a write, which a read-only
             # connection cannot do and a read-only caller does not need.
-            if not is_read_only():
+            #
+            # A table held in full has no per-ticker bounds to keep, and an
+            # empty bounds table sitting beside a missing data table is what a
+            # broken cache looks like, so creating one anyway points diagnosis
+            # the wrong way.
+            if not is_read_only() and self.table.full_refresh_days is None:
                 await self._ensure_sync_bounds_table()
         return self._conn
 
@@ -537,6 +542,15 @@ class _CacheManager:
 
     async def _data_table_exists(self) -> bool:
         return await self._table_exists(self.table.safe_table_name())
+
+    async def _holds_rows(self) -> bool:
+        """Whether the data table is there and has anything in it."""
+        if not await self._data_table_exists():
+            return False
+        conn = await self._get_conn()
+        cursor = await conn.execute(
+            f'SELECT EXISTS (SELECT 1 FROM {self.table.safe_table_name()})')
+        return (await cursor.fetchone())[0]
 
     async def _ensure_universe(self):
         """
@@ -1017,8 +1031,16 @@ class _CacheManager:
         than per-ticker bookkeeping: one fetch, one refresh policy, and no
         sync bounds at all.
         """
+        # The stamp says when the table was last replaced, which is the truth
+        # only while the table is still there to have been replaced. Dropping
+        # it by hand is the way out of a schema problem, and the stamp left
+        # behind then claims a fresh copy of a table that does not exist:
+        # every later query answers empty in milliseconds and never refetches.
+        # Measured on a real cache, the tickers table stayed missing, every
+        # symbol read as an unknown category, and every fund was routed to the
+        # equity table, which holds no fund rows.
         synced_at = await self._full_synced_at()
-        if synced_at is not None:
+        if synced_at is not None and await self._holds_rows():
             age = (datetime.now() - datetime.strptime(synced_at, '%Y-%m-%d')).days
             if age < self.table.full_refresh_days:
                 return

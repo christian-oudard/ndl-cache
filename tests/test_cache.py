@@ -1497,6 +1497,51 @@ class TestWholeTableReplacement:
 
         assert self.rows() == before, 'the old copy was destroyed'
 
+    def test_a_table_dropped_by_hand_is_fetched_again(self, use_temp_db):
+        # Dropping the table is the documented way out of a schema problem,
+        # and it leaves behind a stamp claiming a fresh copy of a table that
+        # is no longer there. Every later query then answers empty in
+        # milliseconds and never refetches: the tickers table stayed missing,
+        # every symbol read as an unknown category, and every fund was routed
+        # to the equity table, which holds no fund rows.
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(TICKERS)
+
+        conn = duckdb.connect(get_db_path())
+        conn.execute('DROP TABLE sharadar_tickers')
+        conn.close()
+
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            df = query(TICKERS)
+        assert len(df) == len(self.ROWS)
+
+    def test_a_table_emptied_by_hand_is_fetched_again(self, use_temp_db):
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(TICKERS)
+
+        conn = duckdb.connect(get_db_path())
+        conn.execute('DELETE FROM sharadar_tickers')
+        conn.close()
+
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            df = query(TICKERS)
+        assert len(df) == len(self.ROWS)
+
+    def test_a_table_held_in_full_keeps_no_sync_bounds(self, use_temp_db):
+        # It has none to keep, and an empty bounds table beside a missing data
+        # table is what a cache looks like when it is broken, so leaving one
+        # there in normal operation points diagnosis the wrong way.
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(TICKERS)
+        conn = duckdb.connect(get_db_path(), read_only=True)
+        try:
+            present = conn.execute(
+                'SELECT COUNT(*) FROM information_schema.tables '
+                "WHERE table_name = 'sharadar_tickers_sync_bounds'").fetchone()
+        finally:
+            conn.close()
+        assert present[0] == 0
+
 
 class TestAnOlderVersionCanStillWrite:
     """
