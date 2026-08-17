@@ -1498,6 +1498,55 @@ class TestWholeTableReplacement:
         assert self.rows() == before, 'the old copy was destroyed'
 
 
+class TestAnOlderVersionCanStillWrite:
+    """
+    A cache file is shared with whatever version runs next, and that includes
+    an older one. The tickers table gained a `table` column in its key, and a
+    writer that does not know the column exists has no value to offer for it,
+    so rolling back died on a NOT NULL constraint and the only way out was
+    dropping the table and refetching it.
+    """
+
+    def refresh(self):
+        with patch.object(AsyncNDLClient, 'get_table',
+                          TestWholeTableReplacement.fetch):
+            query(TICKERS)
+
+    def older_writer(self, sql):
+        conn = duckdb.connect(get_db_path())
+        try:
+            conn.execute(sql)
+        finally:
+            conn.close()
+
+    def held(self, ticker):
+        conn = duckdb.connect(get_db_path(), read_only=True)
+        try:
+            return conn.execute(
+                'SELECT "table", name FROM sharadar_tickers WHERE ticker = ?',
+                [ticker]).fetchall()
+        finally:
+            conn.close()
+
+    def test_a_writer_that_omits_the_new_column_still_inserts(self, use_temp_db):
+        self.refresh()
+        self.older_writer("INSERT OR REPLACE INTO sharadar_tickers "
+                          "(ticker, name) VALUES ('NEW', 'an older version')")
+        assert self.held('NEW') == [('', 'an older version')]
+
+    def test_what_an_older_version_wrote_does_not_outlive_the_next_refresh(
+            self, use_temp_db):
+        # Its rows carry no source table, so they would otherwise sit
+        # alongside the real ones forever, matching no table and every query.
+        self.refresh()
+        self.older_writer("INSERT OR REPLACE INTO sharadar_tickers "
+                          "(ticker, name) VALUES ('AAPL', 'an older version')")
+        self.older_writer('UPDATE cache_meta SET full_synced_at = '
+                          'full_synced_at - INTERVAL 5 DAY')
+        self.refresh()
+        assert self.held('AAPL') == [('SEP', 'APPLE INC'), ('SF1', 'APPLE INC')]
+
+
 class TestExplain:
     """
     A query about to pull sixteen years across a universe looks exactly like

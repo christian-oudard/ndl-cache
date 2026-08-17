@@ -17,6 +17,11 @@ class TableDef:
     query_columns: tuple[str, ...]
     date_column: str | None = 'date'
     column_types: dict[str, str] = field(default_factory=dict)
+    # What to store for a column a writer leaves out. A cache file outlives
+    # the version that wrote it and is shared with whatever runs next,
+    # including an older version that does not know a column exists, which
+    # otherwise cannot insert a row at all.
+    column_defaults: dict[str, str] = field(default_factory=dict)
     rows_per_year: int | None = TRADING_DAYS_PER_YEAR  # None = skip row estimation/splitting
     sync_delay_days: int = 0
     # Tables small enough to hold in full, refreshed no more often than this
@@ -153,6 +158,10 @@ ACTIONS = TableDef(
 TICKERS = TableDef(
     name='SHARADAR/TICKERS',
     index_columns=('table', 'ticker'),
+    # An older version keys on ticker alone and writes no `table` at all. The
+    # empty string keeps its inserts working; the rows it leaves behind are
+    # dropped by the next whole-table refresh.
+    column_defaults={'table': ''},
     date_column=None,  # No date-based sync
     full_refresh_days=1,
     query_columns=(

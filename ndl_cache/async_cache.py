@@ -274,6 +274,8 @@ class _CacheManager:
                 await conn.execute(f'DROP TABLE {name}')
 
         col_defs = [f'{_quote(col)} {self.table.column_types.get(col, "DOUBLE")}'
+                    + (f" DEFAULT '{self.table.column_defaults[col]}'"
+                       if col in self.table.column_defaults else '')
                     for col in cols]
         pk = _columns(self.table.index_columns)
         await conn.execute(f"""
