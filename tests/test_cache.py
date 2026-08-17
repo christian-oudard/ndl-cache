@@ -12,7 +12,9 @@ import duckdb
 import pandas as pd
 import pytest
 
-from ndl_cache import SEP, SF1, DAILY, ACTIONS, TICKERS, query, async_query
+from ndl_cache import (
+    SEP, SF1, DAILY, ACTIONS, TICKERS, query, async_query, validate_sync_bounds,
+)
 from ndl_cache.async_cache import (
     get_db_path, _CacheManager, NDL_SPLIT_THRESHOLD, MAX_TICKER_PARAM_CHARS,
     MAX_TICKERS_UNKNOWN_DENSITY,
@@ -1368,3 +1370,51 @@ class TestCoverageNeverOutrunsData:
             df = query(SEP, ticker='AAPL',
                        date_gte='2020-01-01', date_lte='2020-03-31')
         assert len(df) > 0
+
+
+class TestValidateSyncBounds:
+    """
+    A range claimed with no rows behind it is invisible in normal use, so it
+    needs a way to be found and repaired.
+    """
+
+    @staticmethod
+    async def fetch(client, table_name, columns=None, paginate=True, **filters):
+        return pd.DataFrame([
+            {'ticker': 'AAPL', 'date': d.date(), 'close': 1.0,
+             'lastupdated': pd.Timestamp('2020-05-01').date()}
+            for d in pd.bdate_range('2020-01-05', '2020-03-25')])
+
+    def fill(self):
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(SEP, ticker='AAPL',
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+
+    def test_a_range_wider_than_the_data_is_not_an_issue(self, use_temp_db):
+        # Coverage records what was asked for, so reaching past the first and
+        # last row is normal now and must not be reported.
+        self.fill()
+        assert validate_sync_bounds(SEP) == []
+
+    def test_a_claim_with_no_rows_is_found(self, use_temp_db):
+        self.fill()
+        conn = duckdb.connect(get_db_path())
+        conn.execute("DELETE FROM sharadar_sep WHERE ticker = 'AAPL'")
+        conn.close()
+        assert validate_sync_bounds(SEP) == ['AAPL']
+
+    def test_fixing_it_makes_the_range_fetch_again(self, use_temp_db):
+        self.fill()
+        conn = duckdb.connect(get_db_path())
+        conn.execute("DELETE FROM sharadar_sep WHERE ticker = 'AAPL'")
+        conn.close()
+
+        assert validate_sync_bounds(SEP, fix=True) == ['AAPL']
+        assert validate_sync_bounds(SEP) == []
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            df = query(SEP, ticker='AAPL',
+                       date_gte='2020-01-01', date_lte='2020-03-31')
+        assert len(df) > 0
+
+    def test_an_empty_cache_reports_nothing(self, use_temp_db):
+        assert validate_sync_bounds(SEP) == []
