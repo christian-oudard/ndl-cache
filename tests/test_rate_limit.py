@@ -8,7 +8,8 @@ import asyncio
 
 import pytest
 
-from ndl_cache.rate_limit import RateLimiter, Window, parse_retry_after
+from ndl_cache.rate_limit import (
+    RateLimiter, SharedCallLog, Window, default_state_path, parse_retry_after)
 
 
 class FakeClock:
@@ -76,7 +77,7 @@ class TestWindowPacing:
         for _ in range(50):
             await rl.acquire()
             clock.advance(5)
-        assert len(rl._calls) <= 3
+        assert len(rl._log.recent(0)) <= 3
 
 
 class TestCooldown:
@@ -167,6 +168,81 @@ class TestRetryAfter:
 
     def test_garbage_header_returns_none(self):
         assert parse_retry_after({'Retry-After': 'soon'}) is None
+
+
+class TestSharedAcrossProcesses:
+    """
+    The quota belongs to the API key. Two processes each pacing themselves to
+    the published limits together exceed them, so the call history has to live
+    outside any one process.
+    """
+
+    def shared_limiter(self, path, clock, credential='key', **kwargs):
+        return RateLimiter(windows=[Window(calls=3, seconds=10)],
+                           clock=clock.time, sleep=clock.sleep,
+                           log=SharedCallLog(str(path), credential), **kwargs)
+
+    async def test_calls_by_one_process_pace_another(self, tmp_path):
+        state = tmp_path / 'shared.sqlite'
+        clock = FakeClock()
+        first = self.shared_limiter(state, clock)
+        second = self.shared_limiter(state, clock)
+
+        for _ in range(3):
+            await first.acquire()
+        await second.acquire()
+
+        # The second limiter never issued a call of its own, so on its own
+        # history it would have gone straight through.
+        assert clock.slept and clock.slept[-1] == pytest.approx(10.0)
+
+    async def test_a_rejection_stands_every_process_down(self, tmp_path):
+        state = tmp_path / 'shared.sqlite'
+        clock = FakeClock()
+        first = self.shared_limiter(state, clock)
+        second = self.shared_limiter(state, clock)
+
+        first.penalize(60.0)
+        await second.acquire()
+
+        assert clock.slept[-1] == pytest.approx(60.0)
+
+    async def test_separate_credentials_do_not_pace_each_other(self, tmp_path):
+        # A key that is premium for one dataset and not another is normal, and
+        # so is running two accounts. They must not share a budget.
+        state = tmp_path / 'shared.sqlite'
+        clock = FakeClock()
+        mine = self.shared_limiter(state, clock, credential='mine')
+        theirs = self.shared_limiter(state, clock, credential='theirs')
+
+        for _ in range(3):
+            await mine.acquire()
+        await theirs.acquire()
+
+        assert clock.slept == []
+
+    async def test_history_survives_the_process_that_wrote_it(self, tmp_path):
+        state = tmp_path / 'shared.sqlite'
+        clock = FakeClock()
+        first = self.shared_limiter(state, clock)
+        for _ in range(3):
+            await first.acquire()
+        del first
+
+        later = self.shared_limiter(state, clock)
+        await later.acquire()
+        assert clock.slept[-1] == pytest.approx(10.0)
+
+    def test_state_path_ignores_the_cache_file(self, monkeypatch):
+        # Splitting the cache into one file per period is a normal thing to
+        # do, and the quota is still one quota.
+        monkeypatch.delenv('NDL_RATE_LIMIT_STATE', raising=False)
+        monkeypatch.setenv('NDL_CACHE_DB_PATH', '/tmp/some-period.duckdb')
+        assert 'some-period' not in default_state_path()
+
+    def test_empty_state_path_paces_per_process(self, monkeypatch):
+        monkeypatch.setenv('NDL_RATE_LIMIT_STATE', '')
+        assert default_state_path() is None
 
 
 class TestConcurrency:

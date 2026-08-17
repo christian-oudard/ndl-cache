@@ -167,8 +167,11 @@ class AsyncNDLClient:
         self.timeout = timeout or self.DEFAULT_TIMEOUT
         self.max_retries = max_retries if max_retries is not None else self.MAX_RETRIES
         # Shared across this client's concurrent fetchers, so one rejection
-        # stands the whole client down instead of only the worker that saw it.
-        self.rate_limiter = rate_limiter or RateLimiter()
+        # stands the whole client down instead of only the worker that saw it,
+        # and across processes using the same credential, since the quota
+        # belongs to the key rather than to any one process.
+        self.rate_limiter = rate_limiter or RateLimiter(
+            credential=self.api_key)
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
