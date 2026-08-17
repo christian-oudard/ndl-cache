@@ -1450,9 +1450,11 @@ class TestWholeTableReplacement:
     async def fetch(client, table_name, columns=None, paginate=True, **filters):
         return pd.DataFrame(TestWholeTableReplacement.ROWS)
 
-    def legacy_table(self):
+    def legacy_table(self, drop_first: bool = False):
         """A tickers table written before the key became (table, ticker)."""
         conn = duckdb.connect(get_db_path())
+        if drop_first:
+            conn.execute('DROP TABLE sharadar_tickers')
         conn.execute('CREATE TABLE sharadar_tickers '
                      '(ticker VARCHAR PRIMARY KEY, name VARCHAR)')
         conn.executemany('INSERT INTO sharadar_tickers VALUES (?, ?)',
@@ -1496,6 +1498,20 @@ class TestWholeTableReplacement:
                 query(TICKERS)
 
         assert self.rows() == before, 'the old copy was destroyed'
+
+    def test_an_old_layout_is_rebuilt_however_fresh_the_stamp_looks(self, use_temp_db):
+        # How old the copy is and what shape it is are different questions,
+        # and only the first one was being asked first. A table written by a
+        # version with a different key lacks the columns every read orders by,
+        # so a stamp saying it was refreshed today skipped straight past the
+        # rebuild to a read that cannot be planned at all.
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(TICKERS)
+        self.legacy_table(drop_first=True)
+
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            df = query(TICKERS)
+        assert len(df) == len(self.ROWS)
 
     def test_a_table_dropped_by_hand_is_fetched_again(self, use_temp_db):
         # Dropping the table is the documented way out of a schema problem,

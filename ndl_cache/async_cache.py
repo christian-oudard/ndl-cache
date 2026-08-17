@@ -272,11 +272,9 @@ class _CacheManager:
         name = self.table.safe_table_name()
 
         if (self.table.full_refresh_days is not None
-                and await self._table_exists(name)):
-            cursor = await conn.execute(f'DESCRIBE {name}')
-            existing = {row[0] for row in await cursor.fetchall()}
-            if not set(cols) <= existing:
-                await conn.execute(f'DROP TABLE {name}')
+                and await self._data_table_exists()
+                and await self._stale_layout(cols)):
+            await conn.execute(f'DROP TABLE {name}')
 
         col_defs = [f'{_quote(col)} {self.table.column_types.get(col, "DOUBLE")}'
                     + (f" DEFAULT '{self.table.column_defaults[col]}'"
@@ -543,9 +541,31 @@ class _CacheManager:
     async def _data_table_exists(self) -> bool:
         return await self._table_exists(self.table.safe_table_name())
 
-    async def _holds_rows(self) -> bool:
-        """Whether the data table is there and has anything in it."""
-        if not await self._data_table_exists():
+    async def _missing_columns(self, name: str, wanted: list[str]) -> list[str]:
+        """Which of these columns a table does not have, all of them if it is
+        not there at all."""
+        if not await self._table_exists(name):
+            return list(wanted)
+        conn = await self._get_conn()
+        cursor = await conn.execute(f'DESCRIBE {name}')
+        held = {row[0] for row in await cursor.fetchall()}
+        return [col for col in wanted if col not in held]
+
+    async def _stale_layout(self, wanted: list[str]) -> bool:
+        """Whether this table's own copy on disk predates the columns wanted."""
+        return bool(await self._missing_columns(
+            self.table.safe_table_name(), wanted))
+
+    async def _usable(self) -> bool:
+        """
+        Whether the table on disk is one this version can read and rely on.
+
+        Two separate questions, neither of them about age. A table written
+        under a different key lacks the columns every read orders by, so
+        reading it raises rather than returning nothing; and one that is gone
+        or empty has nothing to serve.
+        """
+        if await self._stale_layout(list(self.table.index_columns)):
             return False
         conn = await self._get_conn()
         cursor = await conn.execute(
@@ -607,7 +627,10 @@ class _CacheManager:
         if not tickers or self.table.tickers_table is None:
             return []
         await self._ensure_universe()
-        if not await self._table_exists(TICKERS.safe_table_name()):
+        # Refreshing the universe is best effort, so it may have left a table
+        # written under an older key in place, which this cannot read.
+        if await self._missing_columns(TICKERS.safe_table_name(),
+                                       list(TICKERS.index_columns)):
             return []
         conn = await self._get_conn()
         placeholders = ', '.join(['?'] * len(tickers))
@@ -1031,16 +1054,17 @@ class _CacheManager:
         than per-ticker bookkeeping: one fetch, one refresh policy, and no
         sync bounds at all.
         """
-        # The stamp says when the table was last replaced, which is the truth
-        # only while the table is still there to have been replaced. Dropping
-        # it by hand is the way out of a schema problem, and the stamp left
-        # behind then claims a fresh copy of a table that does not exist:
-        # every later query answers empty in milliseconds and never refetches.
-        # Measured on a real cache, the tickers table stayed missing, every
-        # symbol read as an unknown category, and every fund was routed to the
-        # equity table, which holds no fund rows.
+        # The stamp says how old the copy is, which is worth knowing only once
+        # the copy is one this version can read at all. Asking about age first
+        # skipped the rebuild below for any cache whose table was stamped by
+        # this version and then written by another: an upgrade found the old
+        # layout, and every read of it raised on a column that is not there.
+        # Dropping the table by hand, the documented way out of a schema
+        # problem, left the same stamp behind claiming a fresh copy of a table
+        # that no longer existed, and every query answered empty in
+        # milliseconds and never refetched.
         synced_at = await self._full_synced_at()
-        if synced_at is not None and await self._holds_rows():
+        if synced_at is not None and await self._usable():
             age = (datetime.now() - datetime.strptime(synced_at, '%Y-%m-%d')).days
             if age < self.table.full_refresh_days:
                 return
