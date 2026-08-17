@@ -1418,3 +1418,65 @@ class TestValidateSyncBounds:
 
     def test_an_empty_cache_reports_nothing(self, use_temp_db):
         assert validate_sync_bounds(SEP) == []
+
+
+class TestWholeTableReplacement:
+    """
+    Replacing a table held in full deleted first and discovered problems
+    second, which turned a schema mismatch into 326 rows becoming 0.
+    """
+
+    ROWS = [{'table': 'SEP', 'ticker': 'AAPL', 'name': 'APPLE INC'},
+            {'table': 'SF1', 'ticker': 'AAPL', 'name': 'APPLE INC'},
+            {'table': 'SEP', 'ticker': 'MSFT', 'name': 'MICROSOFT CORP'}]
+
+    @staticmethod
+    async def fetch(client, table_name, columns=None, paginate=True, **filters):
+        return pd.DataFrame(TestWholeTableReplacement.ROWS)
+
+    def legacy_table(self):
+        """A tickers table written before the key became (table, ticker)."""
+        conn = duckdb.connect(get_db_path())
+        conn.execute('CREATE TABLE sharadar_tickers '
+                     '(ticker VARCHAR PRIMARY KEY, name VARCHAR)')
+        conn.executemany('INSERT INTO sharadar_tickers VALUES (?, ?)',
+                         [['OLD1', 'a'], ['OLD2', 'b']])
+        conn.close()
+
+    def rows(self):
+        conn = duckdb.connect(get_db_path(), read_only=True)
+        try:
+            return conn.execute(
+                'SELECT COUNT(*) FROM sharadar_tickers').fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_a_table_missing_new_columns_is_rebuilt(self, use_temp_db):
+        self.legacy_table()
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            df = query(TICKERS)
+        assert len(df) == len(self.ROWS)
+        assert sorted(df.xs('AAPL', level='ticker').index) == ['SEP', 'SF1']
+
+    def test_a_failed_replacement_keeps_the_old_copy(self, use_temp_db):
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(TICKERS)
+        before = self.rows()
+        assert before == len(self.ROWS)
+
+        conn = duckdb.connect(get_db_path())
+        conn.execute('UPDATE cache_meta SET full_synced_at = '
+                     'full_synced_at - INTERVAL 5 DAY')
+        conn.close()
+
+        async def half_written(client, table_name, columns=None,
+                               paginate=True, **filters):
+            # A frame the insert cannot accept, discovered after the delete.
+            return pd.DataFrame([{'table': 'SEP', 'ticker': None,
+                                  'name': 'no key'}])
+
+        with patch.object(AsyncNDLClient, 'get_table', half_written):
+            with pytest.raises(Exception):
+                query(TICKERS)
+
+        assert self.rows() == before, 'the old copy was destroyed'

@@ -202,15 +202,34 @@ class _CacheManager:
         """)
 
     async def _ensure_data_table(self, data_columns: list[str]):
-        """Create data table if it doesn't exist."""
+        """
+        Create the data table, rebuilding it if an older one lacks columns
+        this version needs.
+
+        Only tables held in full are rebuilt. Their contents are refetched on
+        the same call, so dropping costs one request; a per-ticker table would
+        lose work that cannot be recovered so cheaply, and is left alone.
+
+        The tickers table gained a `table` column when its key became
+        (table, ticker), and a cache written before that has no way to accept
+        the new rows.
+        """
         conn = await self._get_conn()
         cols = list(self.table.index_columns) + data_columns
+        name = self.table.safe_table_name()
+
+        if (self.table.full_refresh_days is not None
+                and await self._table_exists(name)):
+            cursor = await conn.execute(f'DESCRIBE {name}')
+            existing = {row[0] for row in await cursor.fetchall()}
+            if not set(cols) <= existing:
+                await conn.execute(f'DROP TABLE {name}')
+
         col_defs = [f'{_quote(col)} {self.table.column_types.get(col, "DOUBLE")}'
                     for col in cols]
         pk = ', '.join(_quote(col) for col in self.table.index_columns)
-
         await conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {self.table.safe_table_name()} (
+            CREATE TABLE IF NOT EXISTS {name} (
                 {', '.join(col_defs)},
                 PRIMARY KEY ({pk})
             )
@@ -913,14 +932,39 @@ class _CacheManager:
             subset=list(self.table.index_columns))
 
         # Replaced wholesale rather than merged, so that rows the provider has
-        # dropped do not linger in the cache forever.
+        # dropped do not linger in the cache forever, and in one transaction so
+        # that a failure between the two leaves the old copy rather than an
+        # empty table. Deleting first and discovering the problem second turned
+        # a schema mismatch into 326 rows becoming 0.
         conn = await self._get_conn()
-        await conn.execute(f'DELETE FROM {self.table.safe_table_name()}')
-        await self._store(store_df, cols)
+        await self._replace_all(store_df, cols)
         await conn.execute(
             'INSERT OR REPLACE INTO cache_meta (table_name, full_synced_at) '
             'VALUES (?, ?)',
             [self.table.name, datetime.now().strftime('%Y-%m-%d')])
+
+    async def _replace_all(self, store_df: pd.DataFrame, cols: list[str]):
+        """Swap the whole table's contents for a new frame, atomically."""
+        conn = await self._get_conn()
+        name = self.table.safe_table_name()
+        col_names = ', '.join(_quote(c) for c in cols)
+        await conn.register('_incoming', store_df)
+        try:
+            # execute_on_self throughout: execute() runs on a duplicated
+            # cursor, which would put the transaction and the insert on
+            # different connections.
+            await conn.execute_on_self('BEGIN TRANSACTION')
+            try:
+                await conn.execute_on_self(f'DELETE FROM {name}')
+                await conn.execute_on_self(
+                    f'INSERT INTO {name} ({col_names}) '
+                    f'SELECT {col_names} FROM _incoming')
+            except BaseException:
+                await conn.execute_on_self('ROLLBACK')
+                raise
+            await conn.execute_on_self('COMMIT')
+        finally:
+            await conn.unregister('_incoming')
 
     async def get_cached(self, **filters) -> pd.DataFrame:
         """Get data from local cache."""
