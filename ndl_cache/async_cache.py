@@ -6,6 +6,7 @@ Provides async_query() for async access and query() for sync access.
 import asyncio
 import os
 import weakref
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -118,6 +119,11 @@ def get_db_path() -> str:
     cache_dir = Path.home() / '.cache' / 'ndl_cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
     return str(cache_dir / 'cache.duckdb')
+
+
+def _columns(cols) -> str:
+    """A quoted column list for a SELECT, an INSERT or a key."""
+    return ', '.join(_quote(col) for col in cols)
 
 
 def _quote(identifier: str) -> str:
@@ -258,7 +264,7 @@ class _CacheManager:
 
         col_defs = [f'{_quote(col)} {self.table.column_types.get(col, "DOUBLE")}'
                     for col in cols]
-        pk = ', '.join(_quote(col) for col in self.table.index_columns)
+        pk = _columns(self.table.index_columns)
         await conn.execute(f"""
             CREATE TABLE IF NOT EXISTS {name} (
                 {', '.join(col_defs)},
@@ -940,31 +946,39 @@ class _CacheManager:
             for ticker, row in grouped.to_dict('index').items()
         }
 
+    @asynccontextmanager
+    async def _staged(self, store_df: pd.DataFrame):
+        """
+        Offer a frame to SQL as `_incoming` for the length of a write.
+
+        Inserted in one statement rather than row by row. DuckDB is columnar,
+        and an executemany of INSERT OR REPLACE pays a separate statement and
+        index probe per row: writing one month of prices for 500 tickers that
+        way took twenty seconds and got slower as the table grew, which is
+        most of what made a warm cache feel slow.
+
+        Everything inside must use execute_on_self. execute() runs on a fresh
+        cursor, which aioduckdb duplicates from the connection, and which
+        therefore cannot see anything registered on it.
+        """
+        conn = await self._get_conn()
+        await conn.register('_incoming', store_df)
+        try:
+            yield conn
+        finally:
+            await conn.unregister('_incoming')
+
     async def _store(self, store_df: pd.DataFrame, cols: list[str]):
         """
-        Write a frame into the data table.
-
-        Registered as a view and inserted in one statement rather than row by
-        row. DuckDB is columnar, and an executemany of INSERT OR REPLACE pays
-        a separate statement and index probe per row: writing one month of
-        prices for 500 tickers that way took twenty seconds and got slower as
-        the table grew, which is most of what made a warm cache feel slow.
+        Merge a frame into the data table.
 
         INSERT OR REPLACE because parallel fetches and retries overlap, and
         the same row can legitimately arrive twice.
         """
-        conn = await self._get_conn()
-        col_names = ', '.join(_quote(c) for c in cols)
-        await conn.register('_incoming', store_df)
-        try:
-            # execute_on_self, not execute: the latter runs on a fresh cursor,
-            # which aioduckdb duplicates from the connection and which
-            # therefore cannot see anything registered on it.
+        async with self._staged(store_df) as conn:
             await conn.execute_on_self(
                 f'INSERT OR REPLACE INTO {self.table.safe_table_name()} '
-                f'({col_names}) SELECT {col_names} FROM _incoming')
-        finally:
-            await conn.unregister('_incoming')
+                f'({_columns(cols)}) SELECT {_columns(cols)} FROM _incoming')
 
     async def _full_synced_at(self) -> str | None:
         """When the whole table was last replaced, or None if never."""
@@ -1023,27 +1037,24 @@ class _CacheManager:
             [self.table.name, datetime.now().strftime('%Y-%m-%d')])
 
     async def _replace_all(self, store_df: pd.DataFrame, cols: list[str]):
-        """Swap the whole table's contents for a new frame, atomically."""
-        conn = await self._get_conn()
+        """
+        Swap the whole table's contents for a new frame, atomically.
+
+        In one transaction so that a failure between the delete and the insert
+        leaves the old copy rather than an empty table.
+        """
         name = self.table.safe_table_name()
-        col_names = ', '.join(_quote(c) for c in cols)
-        await conn.register('_incoming', store_df)
-        try:
-            # execute_on_self throughout: execute() runs on a duplicated
-            # cursor, which would put the transaction and the insert on
-            # different connections.
+        async with self._staged(store_df) as conn:
             await conn.execute_on_self('BEGIN TRANSACTION')
             try:
                 await conn.execute_on_self(f'DELETE FROM {name}')
                 await conn.execute_on_self(
-                    f'INSERT INTO {name} ({col_names}) '
-                    f'SELECT {col_names} FROM _incoming')
+                    f'INSERT INTO {name} ({_columns(cols)}) '
+                    f'SELECT {_columns(cols)} FROM _incoming')
             except BaseException:
                 await conn.execute_on_self('ROLLBACK')
                 raise
             await conn.execute_on_self('COMMIT')
-        finally:
-            await conn.unregister('_incoming')
 
     async def get_cached(self, **filters) -> pd.DataFrame:
         """Get data from local cache."""
@@ -1081,7 +1092,7 @@ class _CacheManager:
         cursor = await conn.execute(f"""
             SELECT * FROM {self.table.safe_table_name()}
             WHERE {where}
-            ORDER BY {', '.join(_quote(c) for c in self.table.index_columns)}
+            ORDER BY {_columns(self.table.index_columns)}
         """, params)
 
         rows = await cursor.fetchall()
