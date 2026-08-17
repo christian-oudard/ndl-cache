@@ -39,6 +39,8 @@ from .async_cache import (
     query,
     async_query,
     get_db_path,
+    is_read_only,
+    QueryPlan,
     validate_sync_bounds,
     async_validate_sync_bounds,
 )
@@ -69,6 +71,8 @@ __all__ = [
     'query',
     'async_query',
     'get_db_path',
+    'is_read_only',
+    'QueryPlan',
     'validate_sync_bounds',
     'async_validate_sync_bounds',
     # Price data

@@ -6,6 +6,7 @@ Provides async_query() for async access and query() for sync access.
 import asyncio
 import os
 import weakref
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -79,6 +80,39 @@ def _get_table_lock(table_name: str, loop: asyncio.AbstractEventLoop) -> asyncio
     return lock
 
 
+@dataclass(frozen=True)
+class QueryPlan:
+    """
+    What a query would fetch, without fetching it.
+
+    A query about to pull sixteen years across fifteen thousand tickers looks
+    exactly like one that returns from cache in a millisecond, and the only
+    way to tell them apart used to be to run it and wait.
+    """
+    table: str
+    cached_tickers: int
+    fetch_tickers: int
+    fetch_ranges: list[tuple[str, str]] = field(default_factory=list)
+    requests: int = 0
+    estimated_rows: int | None = None
+
+    @property
+    def satisfied(self) -> bool:
+        """Whether the cache already holds everything asked for."""
+        return self.requests == 0
+
+
+def is_read_only() -> bool:
+    """
+    Whether to open the cache without contending for the write lock.
+
+    A read-only connection serves whatever is cached and never syncs, so
+    several analysis processes can share one cache file. It does not let you
+    read while another process writes; DuckDB refuses that either way.
+    """
+    return os.environ.get('NDL_CACHE_READ_ONLY', '').lower() in ('1', 'true', 'yes')
+
+
 def is_cache_disabled() -> bool:
     """Check if cache is disabled via environment variable."""
     return os.environ.get('NDL_CACHE_DISABLED', '').lower() in ('1', 'true', 'yes')
@@ -139,7 +173,8 @@ class _CacheManager:
 
         for attempt in range(max_retries):
             try:
-                self._conn = await aioduckdb.connect(self._db_path)
+                self._conn = await aioduckdb.connect(
+                    self._db_path, read_only=is_read_only())
                 return self._conn
             except duckdb.IOException as e:
                 last_error = e
@@ -164,7 +199,10 @@ class _CacheManager:
         """Get or create the async DuckDB connection with table initialization."""
         if self._conn is None:
             await self._get_conn_without_init()
-            await self._ensure_sync_bounds_table()
+            # Creating the bookkeeping table is a write, which a read-only
+            # connection cannot do and a read-only caller does not need.
+            if not is_read_only():
+                await self._ensure_sync_bounds_table()
         return self._conn
 
     async def _get_ndl_client(self) -> AsyncNDLClient:
@@ -686,6 +724,54 @@ class _CacheManager:
             for req in requests
         ]
 
+    async def plan(self, **filters) -> QueryPlan:
+        """
+        Work out what a query would fetch, without fetching anything.
+
+        Reuses the same gap finding and splitting the query itself uses, so
+        the request count is what would actually go out rather than a guess
+        about it. Touches the network not at all, and so does not run the
+        staleness check: this answers "what would this cost right now".
+        """
+        ticker_filter = filters.get('ticker')
+        if isinstance(ticker_filter, str):
+            tickers = [ticker_filter]
+        elif isinstance(ticker_filter, list):
+            tickers = list(ticker_filter)
+        else:
+            tickers = []
+
+        date_col = self.table.date_column
+        date_gte = filters.get(f'{date_col}_gte') if date_col else None
+        date_lte = filters.get(f'{date_col}_lte') if date_col else None
+
+        if not tickers or not (date_gte and date_lte):
+            return QueryPlan(table=self.table.name, cached_tickers=len(tickers),
+                             fetch_tickers=0)
+
+        bounds = await self._get_sync_bounds(tickers)
+        fetches = self._compute_optimal_fetches(
+            tickers, date_gte, date_lte, bounds)
+
+        wanted = set()
+        ranges = set()
+        for fetch in fetches:
+            wanted.update(self._tickers_in([fetch]))
+            ranges.add((fetch[f'{date_col}_gte'], fetch[f'{date_col}_lte']))
+
+        chunks = [c for fetch in fetches for c in self._split_filters(fetch)]
+        rows = (sum(self._estimate_rows(c) for c in chunks)
+                if self.table.rows_per_year is not None else None)
+
+        return QueryPlan(
+            table=self.table.name,
+            cached_tickers=len(set(tickers) - wanted),
+            fetch_tickers=len(wanted),
+            fetch_ranges=sorted(ranges),
+            requests=len(chunks),
+            estimated_rows=rows,
+        )
+
     async def fetch_from_ndl(self, **filters) -> pd.DataFrame:
         """Fetch data from NDL API using async client."""
         client = await self._get_ndl_client()
@@ -1083,6 +1169,11 @@ class _CacheManager:
                 return result
             return pd.DataFrame()
 
+        if is_read_only():
+            # Serve what is held and sync nothing, so several readers can
+            # share one cache file.
+            return self._select_columns(await self.get_cached(**filters), columns)
+
         # Lock the entire read-fetch-write cycle per table to prevent race conditions
         loop = asyncio.get_running_loop()
         lock = _get_table_lock(self.table.name, loop)
@@ -1163,8 +1254,9 @@ async def async_query(
     table: TableDef,
     /,
     columns: list[str] | str | None = None,
+    explain: bool = False,
     **filters,
-) -> pd.DataFrame:
+) -> pd.DataFrame | QueryPlan:
     """
     Query data from a Sharadar table asynchronously.
 
@@ -1182,6 +1274,8 @@ async def async_query(
         df = await async_query(SEP, ticker='AAPL', date_gte='2024-01-01', date_lte='2024-12-31')
     """
     async with _CacheManager(table) as mgr:
+        if explain:
+            return await mgr.plan(**filters)
         return await mgr.query(columns=columns, **filters)
 
 
@@ -1189,8 +1283,9 @@ def query(
     table: TableDef,
     /,
     columns: list[str] | str | None = None,
+    explain: bool = False,
     **filters,
-) -> pd.DataFrame:
+) -> pd.DataFrame | QueryPlan:
     """
     Query data from a Sharadar table synchronously.
 
@@ -1207,7 +1302,8 @@ def query(
 
         df = query(SEP, ticker='AAPL', date_gte='2024-01-01', date_lte='2024-12-31')
     """
-    return asyncio.run(async_query(table, columns=columns, **filters))
+    return asyncio.run(
+        async_query(table, columns=columns, explain=explain, **filters))
 
 
 async def async_validate_sync_bounds(

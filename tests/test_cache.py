@@ -1494,3 +1494,116 @@ class TestWholeTableReplacement:
                 query(TICKERS)
 
         assert self.rows() == before, 'the old copy was destroyed'
+
+
+class TestExplain:
+    """
+    A query about to pull sixteen years across a universe looks exactly like
+    one that returns from cache in a millisecond.
+    """
+
+    @staticmethod
+    async def fetch(client, table_name, columns=None, paginate=True, **filters):
+        named = filters['ticker']
+        named = named if isinstance(named, list) else [named]
+        return pd.DataFrame([
+            {'ticker': t, 'date': d.date(), 'marketcap': 1.0,
+             'lastupdated': pd.Timestamp('2024-05-01').date()}
+            for t in named for d in pd.bdate_range('2024-01-02', '2024-01-31')])
+
+    def test_an_empty_cache_reports_what_it_would_fetch(self, use_temp_db):
+        plan = query(DAILY, ticker=['AAPL', 'MSFT'],
+                     date_gte='2024-01-02', date_lte='2024-01-31', explain=True)
+        assert plan.fetch_tickers == 2
+        assert plan.cached_tickers == 0
+        assert plan.requests == 1
+        assert not plan.satisfied
+
+    def test_explaining_never_touches_the_network(self, use_temp_db):
+        calls = []
+
+        async def counted(client, table_name, columns=None, paginate=True, **f):
+            calls.append(f)
+            return pd.DataFrame()
+
+        with patch.object(AsyncNDLClient, 'get_table', counted):
+            query(DAILY, ticker=['AAPL'], date_gte='2024-01-02',
+                  date_lte='2024-01-31', explain=True)
+        assert calls == []
+
+    def test_a_satisfied_query_plans_no_requests(self, use_temp_db):
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(DAILY, ticker=['AAPL', 'MSFT'],
+                  date_gte='2024-01-02', date_lte='2024-01-31')
+        plan = query(DAILY, ticker=['AAPL', 'MSFT'],
+                     date_gte='2024-01-02', date_lte='2024-01-31', explain=True)
+        assert plan.satisfied
+        assert plan.requests == 0
+        assert plan.cached_tickers == 2
+
+    def test_a_backwards_reach_is_visible_before_it_is_paid_for(self, use_temp_db):
+        # The whole point: one day of 2008 against a cache holding 2024 costs
+        # everything in between, and that should be readable in advance.
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(DAILY, ticker=['AAPL'],
+                  date_gte='2024-01-02', date_lte='2024-01-31')
+        plan = query(DAILY, ticker=['AAPL'], date_gte='2008-06-30',
+                     date_lte='2008-06-30', explain=True)
+        (start, end), = plan.fetch_ranges
+        assert start == '2008-06-30'
+        assert end > '2023-01-01', 'the reach should show as years, not a day'
+        assert plan.estimated_rows > 1000
+
+
+class TestReadOnlyMode:
+    """
+    DuckDB takes an exclusive lock, so one writer blocks every reader. A
+    read-only connection lets several analysis processes share a cache.
+    """
+
+    @staticmethod
+    async def fetch(client, table_name, columns=None, paginate=True, **filters):
+        return pd.DataFrame([
+            {'ticker': 'AAPL', 'date': d.date(), 'marketcap': 1.0,
+             'lastupdated': pd.Timestamp('2024-05-01').date()}
+            for d in pd.bdate_range('2024-01-02', '2024-01-31')])
+
+    def fill(self):
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(DAILY, ticker='AAPL',
+                  date_gte='2024-01-02', date_lte='2024-01-31')
+
+    def test_cached_data_is_still_served(self, use_temp_db, monkeypatch):
+        self.fill()
+        monkeypatch.setenv('NDL_CACHE_READ_ONLY', '1')
+        df = query(DAILY, ticker='AAPL',
+                   date_gte='2024-01-02', date_lte='2024-01-31')
+        assert len(df) > 0
+
+    def test_nothing_is_fetched_or_written(self, use_temp_db, monkeypatch):
+        self.fill()
+        monkeypatch.setenv('NDL_CACHE_READ_ONLY', '1')
+        calls = []
+
+        async def counted(client, table_name, columns=None, paginate=True, **f):
+            calls.append(f)
+            return pd.DataFrame()
+
+        with patch.object(AsyncNDLClient, 'get_table', counted):
+            # A range the cache does not hold: it must come back short rather
+            # than sync, since syncing is a write.
+            df = query(DAILY, ticker='AAPL',
+                       date_gte='2020-01-02', date_lte='2024-01-31')
+        assert calls == []
+        assert len(df) > 0
+
+    def test_several_readers_can_share_one_cache(self, use_temp_db, monkeypatch):
+        self.fill()
+        monkeypatch.setenv('NDL_CACHE_READ_ONLY', '1')
+        other = duckdb.connect(get_db_path(), read_only=True)
+        try:
+            df = query(DAILY, ticker='AAPL',
+                       date_gte='2024-01-02', date_lte='2024-01-31')
+            assert len(df) > 0
+        finally:
+            other.close()
