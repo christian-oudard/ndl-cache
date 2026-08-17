@@ -8,10 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import aioduckdb
+import duckdb
 import pandas as pd
 import pytest
 
-from ndl_cache import SEP, DAILY, query, async_query
+from ndl_cache import SEP, DAILY, TICKERS, query, async_query
 from ndl_cache.async_cache import (
     get_db_path, _CacheManager, NDL_SPLIT_THRESHOLD, MAX_TICKER_PARAM_CHARS,
 )
@@ -834,3 +835,82 @@ class TestUrlLengthSplitting:
         for chunk in chunks:
             assert self._ticker_chars(chunk) <= MAX_TICKER_PARAM_CHARS
             assert mgr._estimate_rows(chunk) < NDL_SPLIT_THRESHOLD
+
+
+class TestWholeTableCache:
+    """
+    SHARADAR/TICKERS is small, wanted in full by every caller, and was fetched
+    from the network on every process start. It is cached as a unit instead:
+    one fetch, one refresh window, no per-ticker bookkeeping.
+    """
+
+    ROWS = [
+        # AAPL appears once per source table. Keying on ticker alone kept
+        # whichever row arrived first and silently dropped the other two.
+        {'table': 'SEP', 'ticker': 'AAPL', 'name': 'APPLE INC',
+         'permaticker': 199059, 'isdelisted': 'N'},
+        {'table': 'SF1', 'ticker': 'AAPL', 'name': 'APPLE INC',
+         'permaticker': 199059, 'isdelisted': 'N'},
+        {'table': 'SF2', 'ticker': 'AAPL', 'name': 'APPLE INC',
+         'permaticker': 199059, 'isdelisted': 'N'},
+        {'table': 'SEP', 'ticker': 'MSFT', 'name': 'MICROSOFT CORP',
+         'permaticker': 118443, 'isdelisted': 'N'},
+        {'table': 'SFP', 'ticker': 'SPY', 'name': 'SPDR S&P 500 ETF',
+         'permaticker': 122000, 'isdelisted': 'N'},
+    ]
+
+    @pytest.fixture
+    def fetches(self):
+        """Patch the client to serve a small TICKERS table, counting fetches."""
+        calls = []
+        rows = list(self.ROWS)
+
+        async def mock_get_table(self, table_name, columns=None, paginate=True,
+                                 **filters):
+            calls.append(filters)
+            return pd.DataFrame(rows)
+
+        with patch.object(AsyncNDLClient, 'get_table', mock_get_table):
+            yield calls, rows
+
+    def test_first_query_fetches_the_whole_table(self, use_temp_db, fetches):
+        calls, _ = fetches
+        df = query(TICKERS)
+        assert len(calls) == 1
+        # Fetched whole: no ticker filter went out.
+        assert 'ticker' not in calls[0]
+        assert len(df) == len(self.ROWS)
+
+    def test_second_query_does_not_touch_the_network(self, use_temp_db, fetches):
+        calls, _ = fetches
+        query(TICKERS)
+        query(TICKERS)
+        assert len(calls) == 1
+
+    def test_a_ticker_keeps_a_row_per_source_table(self, use_temp_db, fetches):
+        df = query(TICKERS)
+        aapl = df.xs('AAPL', level='ticker')
+        assert sorted(aapl.index) == ['SEP', 'SF1', 'SF2']
+
+    def test_filters_are_served_from_the_cached_copy(self, use_temp_db, fetches):
+        calls, _ = fetches
+        query(TICKERS)
+        df = query(TICKERS, table='SEP')
+        assert len(calls) == 1
+        assert sorted(df.index.get_level_values('ticker')) == ['AAPL', 'MSFT']
+
+    def test_a_stale_copy_is_replaced_not_merged(self, use_temp_db, fetches):
+        # Rows the provider has dropped must not linger. Merging would keep
+        # every ticker that ever existed.
+        calls, rows = fetches
+        query(TICKERS)
+
+        conn = duckdb.connect(get_db_path())
+        conn.execute("UPDATE cache_meta SET full_synced_at = full_synced_at "
+                     "- INTERVAL 5 DAY")
+        conn.close()
+
+        rows[:] = [row for row in rows if row['ticker'] != 'SPY']
+        df = query(TICKERS)
+        assert len(calls) == 2
+        assert 'SPY' not in set(df.index.get_level_values('ticker'))

@@ -13,7 +13,7 @@ import aioduckdb
 import duckdb
 import pandas as pd
 
-from .async_client import AsyncNDLClient
+from .async_client import AsyncNDLClient, NDLError
 from .cover import solve_cover, find_gaps
 from .tables import TableDef, TRADING_DAYS_PER_YEAR
 
@@ -81,6 +81,16 @@ def get_db_path() -> str:
     cache_dir = Path.home() / '.cache' / 'ndl_cache'
     cache_dir.mkdir(parents=True, exist_ok=True)
     return str(cache_dir / 'cache.duckdb')
+
+
+def _quote(identifier: str) -> str:
+    """
+    Quote a column name for SQL.
+
+    SHARADAR/TICKERS has a column called `table`, which is a reserved word, so
+    identifiers cannot be interpolated bare.
+    """
+    return '"' + identifier.replace('"', '""') + '"'
 
 
 def _effective_sync_date(date_str: str, delay_days: int) -> str:
@@ -185,8 +195,9 @@ class _CacheManager:
         """Create data table if it doesn't exist."""
         conn = await self._get_conn()
         cols = list(self.table.index_columns) + data_columns
-        col_defs = [f'{col} {self.table.column_types.get(col, "DOUBLE")}' for col in cols]
-        pk = ', '.join(self.table.index_columns)
+        col_defs = [f'{_quote(col)} {self.table.column_types.get(col, "DOUBLE")}'
+                    for col in cols]
+        pk = ', '.join(_quote(col) for col in self.table.index_columns)
 
         await conn.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.table.safe_table_name()} (
@@ -558,6 +569,7 @@ class _CacheManager:
         if not filter_sets:
             return 0
 
+        conn = await self._get_conn()
         queried = await self._fetch_parallel(filter_sets)
 
         # Extract actual date ranges and max_lastupdated per ticker from returned data
@@ -618,14 +630,14 @@ class _CacheManager:
         Registered as a view and inserted in one statement rather than row by
         row. DuckDB is columnar, and an executemany of INSERT OR REPLACE pays
         a separate statement and index probe per row: writing one month of
-        prices for 500 tickers that way took twenty seconds, and got slower as
+        prices for 500 tickers that way took twenty seconds and got slower as
         the table grew, which is most of what made a warm cache feel slow.
 
         INSERT OR REPLACE because parallel fetches and retries overlap, and
         the same row can legitimately arrive twice.
         """
         conn = await self._get_conn()
-        col_names = ', '.join(cols)
+        col_names = ', '.join(_quote(c) for c in cols)
         await conn.register('_incoming', store_df)
         try:
             # execute_on_self, not execute: the latter runs on a fresh cursor,
@@ -637,6 +649,60 @@ class _CacheManager:
         finally:
             await conn.unregister('_incoming')
 
+    async def _full_synced_at(self) -> str | None:
+        """When the whole table was last replaced, or None if never."""
+        conn = await self._get_conn()
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cache_meta (
+                table_name VARCHAR PRIMARY KEY,
+                full_synced_at DATE
+            )
+        """)
+        cursor = await conn.execute(
+            'SELECT full_synced_at FROM cache_meta WHERE table_name = ?',
+            [self.table.name])
+        row = await cursor.fetchone()
+        return str(row[0])[:10] if row and row[0] else None
+
+    async def _sync_full_table(self):
+        """
+        Replace the whole table if the copy on disk is older than the table's
+        refresh window.
+
+        For a table every caller wants in full, this is cheaper and simpler
+        than per-ticker bookkeeping: one fetch, one refresh policy, and no
+        sync bounds at all.
+        """
+        synced_at = await self._full_synced_at()
+        if synced_at is not None:
+            age = (datetime.now() - datetime.strptime(synced_at, '%Y-%m-%d')).days
+            if age < self.table.full_refresh_days:
+                return
+
+        client = await self._get_ndl_client()
+        fetched = await client.get_table(
+            self.table.name, columns=self.table.all_columns, paginate=True)
+        if len(fetched) == 0:
+            raise NDLError(f'{self.table.name} returned no rows')
+
+        data_columns = [c for c in self.table.query_columns
+                        if c in fetched.columns]
+        await self._ensure_data_table(data_columns)
+
+        cols = list(self.table.index_columns) + data_columns
+        store_df = fetched[cols].drop_duplicates(
+            subset=list(self.table.index_columns))
+
+        # Replaced wholesale rather than merged, so that rows the provider has
+        # dropped do not linger in the cache forever.
+        conn = await self._get_conn()
+        await conn.execute(f'DELETE FROM {self.table.safe_table_name()}')
+        await self._store(store_df, cols)
+        await conn.execute(
+            'INSERT OR REPLACE INTO cache_meta (table_name, full_synced_at) '
+            'VALUES (?, ?)',
+            [self.table.name, datetime.now().strftime('%Y-%m-%d')])
+
     async def get_cached(self, **filters) -> pd.DataFrame:
         """Get data from local cache."""
         conn = await self._get_conn()
@@ -645,17 +711,17 @@ class _CacheManager:
         params = []
         for key, value in filters.items():
             if key.endswith('_gte'):
-                where_clauses.append(f"{key[:-4]} >= ?")
+                where_clauses.append(f"{_quote(key[:-4])} >= ?")
                 params.append(value)
             elif key.endswith('_lte'):
-                where_clauses.append(f"{key[:-4]} <= ?")
+                where_clauses.append(f"{_quote(key[:-4])} <= ?")
                 params.append(value)
             elif isinstance(value, list):
                 placeholders = ', '.join(['?'] * len(value))
-                where_clauses.append(f"{key} IN ({placeholders})")
+                where_clauses.append(f"{_quote(key)} IN ({placeholders})")
                 params.extend(value)
             else:
-                where_clauses.append(f"{key} = ?")
+                where_clauses.append(f"{_quote(key)} = ?")
                 params.append(value)
 
         where = ' AND '.join(where_clauses) if where_clauses else '1=1'
@@ -673,7 +739,7 @@ class _CacheManager:
         cursor = await conn.execute(f"""
             SELECT * FROM {self.table.safe_table_name()}
             WHERE {where}
-            ORDER BY {', '.join(self.table.index_columns)}
+            ORDER BY {', '.join(_quote(c) for c in self.table.index_columns)}
         """, params)
 
         rows = await cursor.fetchall()
@@ -758,6 +824,11 @@ class _CacheManager:
         loop = asyncio.get_running_loop()
         lock = _get_table_lock(self.table.name, loop)
         async with lock:
+            if self.table.full_refresh_days is not None:
+                await self._sync_full_table()
+                return self._select_columns(
+                    await self.get_cached(**filters), columns)
+
             if tickers:
                 await self._check_and_invalidate_stale(tickers)
 
@@ -806,15 +877,19 @@ class _CacheManager:
                     # Re-fetch from cache
                     result = await self.get_cached(**filters)
 
+        return self._select_columns(result, columns)
+
+    @staticmethod
+    def _select_columns(result: pd.DataFrame,
+                        columns: list[str] | str | None) -> pd.DataFrame:
+        """Narrow a result to the requested columns."""
         if len(result) == 0:
             return pd.DataFrame()
-
-        if columns is not None:
-            if isinstance(columns, str):
-                columns = [columns]
-            result = result[[c for c in columns if c in result.columns]]
-
-        return result
+        if columns is None:
+            return result
+        if isinstance(columns, str):
+            columns = [columns]
+        return result[[c for c in columns if c in result.columns]]
 
 
 # -----------------------------------------------------------------------------
@@ -823,6 +898,7 @@ class _CacheManager:
 
 async def async_query(
     table: TableDef,
+    /,
     columns: list[str] | str | None = None,
     **filters,
 ) -> pd.DataFrame:
@@ -848,6 +924,7 @@ async def async_query(
 
 def query(
     table: TableDef,
+    /,
     columns: list[str] | str | None = None,
     **filters,
 ) -> pd.DataFrame:

@@ -19,6 +19,9 @@ class TableDef:
     column_types: dict[str, str] = field(default_factory=dict)
     rows_per_year: int | None = TRADING_DAYS_PER_YEAR  # None = skip row estimation/splitting
     sync_delay_days: int = 0
+    # Tables small enough to hold in full, refreshed no more often than this
+    # many days. None means the table is synced per ticker instead.
+    full_refresh_days: int | None = None
 
     @property
     def all_columns(self) -> list[str]:
@@ -129,19 +132,31 @@ ACTIONS = TableDef(
     },
 )
 
-# Ticker metadata
+# Ticker metadata.
+#
+# One row per ticker per source table, so AAPL appears three times: once for
+# SEP, once for SF1, once for SF2. Keying on ticker alone silently kept
+# whichever row arrived first and dropped the rest.
+#
+# The whole table is a few tens of thousands of rows and every caller wants
+# all of it, so it is refreshed as a unit rather than per ticker.
 TICKERS = TableDef(
     name='SHARADAR/TICKERS',
-    index_columns=('ticker',),
+    index_columns=('table', 'ticker'),
     date_column=None,  # No date-based sync
+    full_refresh_days=1,
     query_columns=(
         'name', 'exchange', 'category', 'cusips', 'siccode', 'sicsector',
         'sicindustry', 'famaindustry', 'sector', 'industry',
         'scalemarketcap', 'scalerevenue', 'currency', 'location', 'lastupdated',
         'firstadded', 'firstpricedate', 'lastpricedate', 'firstquarter',
         'lastquarter', 'secfilings', 'companysite', 'isdelisted', 'permaticker',
+        'figi', 'relatedtickers',
     ),
     column_types={
+        'table': 'VARCHAR',
+        'figi': 'VARCHAR',
+        'relatedtickers': 'VARCHAR',
         'ticker': 'VARCHAR',
         'name': 'VARCHAR',
         'exchange': 'VARCHAR',
