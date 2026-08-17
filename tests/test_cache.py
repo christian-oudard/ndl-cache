@@ -12,11 +12,12 @@ import duckdb
 import pandas as pd
 import pytest
 
-from ndl_cache import SEP, DAILY, TICKERS, query, async_query
+from ndl_cache import SEP, SF1, DAILY, ACTIONS, TICKERS, query, async_query
 from ndl_cache.async_cache import (
     get_db_path, _CacheManager, NDL_SPLIT_THRESHOLD, MAX_TICKER_PARAM_CHARS,
+    MAX_TICKERS_UNKNOWN_DENSITY,
 )
-from ndl_cache.async_client import AsyncNDLClient
+from ndl_cache.async_client import AsyncNDLClient, NDLError
 from ndl_cache.testing import temp_db
 
 
@@ -1007,3 +1008,139 @@ class TestStalenessCheck:
         # cached copy is wrong and has to go.
         _, dropped = self.fill_then_query_next_day(restated=True)
         assert dropped == ['AAPL']
+
+
+class TestCoverageRecordsWhatWasAsked:
+    """
+    A range with no rows in it has still been answered: the provider was asked
+    and said there is nothing there. Recording only the rows received leaves
+    the empty parts permanently unsatisfied.
+    """
+
+    # New Year's Day and Good Friday, both inside the range asked for and both
+    # sitting on its boundary.
+    CLOSED = {'2020-01-01', '2020-04-10'}
+    SPAN = ('2020-01-01', '2020-04-10')
+
+    def mock(self, calls, silent_tickers=()):
+        async def get_table(client, table_name, columns=None, paginate=True,
+                            **filters):
+            calls.append(filters)
+            span = filters.get('date', {})
+            tickers = filters.get('ticker') or []
+            if isinstance(tickers, str):
+                tickers = [tickers]
+            rows = [
+                {'ticker': ticker, 'date': date.date(), 'marketcap': 1.0,
+                 'lastupdated': pd.Timestamp('2020-05-01').date()}
+                for ticker in tickers if ticker not in silent_tickers
+                for date in pd.bdate_range(span.get('gte', self.SPAN[0]),
+                                           span.get('lte', self.SPAN[1]))
+                if str(date.date()) not in self.CLOSED
+            ]
+            return pd.DataFrame(rows)
+
+        return get_table
+
+    def test_a_fully_cached_query_touches_nothing(self, use_temp_db):
+        # Market holidays at either end of the range never return a row, so
+        # they were never satisfied and were refetched on every single call.
+        calls = []
+        with patch.object(AsyncNDLClient, 'get_table', self.mock(calls)):
+            query(DAILY, ticker='AAPL',
+                  date_gte=self.SPAN[0], date_lte=self.SPAN[1])
+            assert len(calls) == 1
+            calls.clear()
+            query(DAILY, ticker='AAPL',
+                  date_gte=self.SPAN[0], date_lte=self.SPAN[1])
+        assert calls == []
+
+    def test_a_ticker_that_never_returned_a_row_is_not_assumed_empty(
+            self, use_temp_db):
+        # It would have no lastupdated watermark, so nothing could ever
+        # invalidate the guess. Refetching it is the safe direction.
+        calls = []
+        mock = self.mock(calls, silent_tickers={'NOPE'})
+        with patch.object(AsyncNDLClient, 'get_table', mock):
+            query(DAILY, ticker='NOPE',
+                  date_gte=self.SPAN[0], date_lte=self.SPAN[1])
+            calls.clear()
+            query(DAILY, ticker='NOPE',
+                  date_gte=self.SPAN[0], date_lte=self.SPAN[1])
+        assert calls, 'a ticker with no data must keep being asked about'
+
+    def test_a_range_beyond_what_was_asked_is_not_claimed(self, use_temp_db):
+        calls = []
+        with patch.object(AsyncNDLClient, 'get_table', self.mock(calls)):
+            query(DAILY, ticker='AAPL',
+                  date_gte=self.SPAN[0], date_lte=self.SPAN[1])
+            calls.clear()
+            query(DAILY, ticker='AAPL',
+                  date_gte='2019-06-01', date_lte=self.SPAN[1])
+        assert calls, 'reaching further back must still fetch'
+
+
+class TestUnknownDensitySplitting:
+    """
+    SF1 and ACTIONS declare rows_per_year=None, so their requests cannot be
+    sized by row count. They still have to be bounded: SF1 is around 600 rows
+    per ticker across all dimensions, so two thousand tickers in one request
+    is 119 pages, past the limit that now raises.
+    """
+
+    @pytest.fixture
+    def mgr(self, use_temp_db):
+        return _CacheManager(SF1)
+
+    def test_a_long_ticker_list_is_split(self, mgr):
+        tickers = [f'TICK{i:04d}' for i in range(2000)]
+        chunks = mgr._split_filters({'ticker': tickers})
+        assert len(chunks) > 1
+        for chunk in chunks:
+            named = chunk['ticker']
+            named = named if isinstance(named, list) else [named]
+            assert len(named) <= MAX_TICKERS_UNKNOWN_DENSITY
+
+    def test_every_ticker_survives_the_split(self, mgr):
+        tickers = [f'TICK{i:04d}' for i in range(2000)]
+        seen = []
+        for chunk in mgr._split_filters({'ticker': tickers}):
+            named = chunk['ticker']
+            seen.extend(named if isinstance(named, list) else [named])
+        assert sorted(seen) == sorted(tickers)
+
+    def test_a_short_list_is_left_alone(self, mgr):
+        assert len(mgr._split_filters({'ticker': ['AAPL', 'MSFT']})) == 1
+
+
+class TestTablesWithoutAWatermark:
+    """
+    ACTIONS has no lastupdated column, and asking for one is a 403 rather than
+    an empty result, so probing it wastes a failing request every day.
+    """
+
+    def test_no_staleness_probe_is_issued(self, use_temp_db):
+        calls = []
+
+        async def get_table(client, table_name, columns=None, paginate=True,
+                            **filters):
+            calls.append({'columns': columns, **filters})
+            if columns and 'lastupdated' in columns:
+                raise NDLError('["lastupdated"] column does not exist.', 403)
+            return pd.DataFrame([{'ticker': 'AAPL', 'date': pd.Timestamp(
+                '2020-03-02').date(), 'action': 'dividend', 'value': 0.2}])
+
+        with patch.object(AsyncNDLClient, 'get_table', get_table):
+            query(ACTIONS, ticker='AAPL',
+                  date_gte='2020-01-01', date_lte='2020-12-31')
+            conn = duckdb.connect(get_db_path())
+            conn.execute('UPDATE sharadar_actions_sync_bounds SET '
+                         'last_staleness_check = last_staleness_check '
+                         '- INTERVAL 1 DAY')
+            conn.close()
+            calls.clear()
+            query(ACTIONS, ticker='AAPL',
+                  date_gte='2020-01-01', date_lte='2020-12-31')
+
+        assert not [c for c in calls if c.get('columns')
+                    and 'lastupdated' in c['columns']]

@@ -337,12 +337,14 @@ class AsyncNDLClient:
 
             page_count += 1
             if page_count >= self.PAGE_LIMIT:
-                warnings.warn(
-                    f"Reached page limit ({self.PAGE_LIMIT}). "
-                    "Some data may be missing. Consider narrowing your query.",
-                    UserWarning,
-                )
-                break
+                # Raised rather than warned. The caller records what it asked
+                # for as cached, so a silently truncated result is not merely
+                # incomplete: it is a permanent hole that the cache believes
+                # it has already filled, and no later query will look again.
+                raise NDLError(
+                    f'{table_name} returned more than {self.PAGE_LIMIT} pages '
+                    f'({len(all_data)} rows so far) for {params}. Narrow the '
+                    f'query; a truncated result would be cached as complete.')
 
             params["qopts.cursor_id"] = next_cursor
 

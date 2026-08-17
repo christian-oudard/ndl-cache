@@ -44,6 +44,11 @@ MAX_TICKER_PARAM_CHARS = 3000
 # trading day across a weekend and a holiday.
 PROBE_DAYS = 7
 
+# Ticker cap for tables whose row density is unknown, so that one request
+# cannot run past the page limit. SF1 is about 600 rows per ticker across all
+# dimensions, so this keeps a request near six pages.
+MAX_TICKERS_UNKNOWN_DENSITY = 100
+
 # Lock per table for entire query operations (read-fetch-write cycle).
 #
 # Problem: asyncio.run() creates a new event loop and closes it after each call.
@@ -400,7 +405,12 @@ class _CacheManager:
         if not tickers_to_check:
             return
 
-        if self.table.date_column is None or not await self._data_table_exists():
+        # ACTIONS has no lastupdated column at all, and asking for one is a
+        # 403 rather than an empty result, so there is nothing to probe with.
+        # Its rows are therefore cached and never refreshed; see IMPROVEMENTS.
+        if (self.table.date_column is None
+                or 'lastupdated' not in self.table.query_columns
+                or not await self._data_table_exists()):
             await self._mark_checked(tickers_to_check, today)
             return
 
@@ -492,8 +502,20 @@ class _CacheManager:
 
     def _split_filters(self, filters: dict, max_rows: int = NDL_SPLIT_THRESHOLD) -> list[dict]:
         """Split a filter set into chunks that each return < max_rows."""
-        # Skip splitting for tables with unknown row density (e.g., sparse ACTIONS table)
+        # Tables whose row density is unknown cannot be sized, but they still
+        # have to be bounded: SF1 returns about 600 rows per ticker across all
+        # dimensions, so two thousand tickers in one request is 119 pages,
+        # past the page limit. That used to truncate silently and now raises,
+        # so cap the ticker count instead of guessing a density.
         if self.table.rows_per_year is None:
+            ticker = filters.get('ticker')
+            if isinstance(ticker, list) and len(ticker) > MAX_TICKERS_UNKNOWN_DENSITY:
+                return [
+                    {**filters, 'ticker': chunk if len(chunk) > 1 else chunk[0]}
+                    for chunk in (
+                        ticker[i:i + MAX_TICKERS_UNKNOWN_DENSITY]
+                        for i in range(0, len(ticker), MAX_TICKERS_UNKNOWN_DENSITY))
+                ]
             return [filters]
 
         date_col = self.table.date_column
@@ -630,24 +652,30 @@ class _CacheManager:
         if not filter_sets:
             return 0
 
-        conn = await self._get_conn()
-        queried = await self._fetch_parallel(filter_sets)
+        # Which tickers this cache already holds data for, read before the
+        # fetch. A ticker that has never returned a row is not given a range
+        # below; see _covered_ranges for why.
+        known = {t for t, b in (await self._get_sync_bounds(
+            self._tickers_in(filter_sets))).items() if b is not None}
 
-        # Extract actual date ranges and max_lastupdated per ticker from returned data
-        # This ensures sync bounds reflect what was actually stored, not what was requested
+        queried = await self._fetch_parallel(filter_sets)
         ticker_stats = self._per_ticker_stats(queried)
 
-        # Update sync bounds based on ACTUAL data received, not requested ranges
+        for ticker, (start, end) in self._covered_ranges(
+                filter_sets, known | set(ticker_stats)).items():
+            await self._update_sync_bounds(
+                ticker, start, end,
+                ticker_stats.get(ticker, {}).get('max_lastupdated'))
+
+        # Tables with no date column, and fetches with no date range, still
+        # record only what came back; there is no requested range to use.
         for ticker, stats in ticker_stats.items():
             if self.table.date_column is None:
                 await self._mark_ticker_synced(ticker, stats.get('max_lastupdated'))
-            else:
-                min_date = stats.get('min_date')
-                max_date = stats.get('max_date')
-                if min_date and max_date:
-                    await self._update_sync_bounds(
-                        ticker, min_date, max_date, stats.get('max_lastupdated')
-                    )
+            elif stats.get('min_date') and stats.get('max_date'):
+                await self._update_sync_bounds(
+                    ticker, stats['min_date'], stats['max_date'],
+                    stats.get('max_lastupdated'))
 
         if len(queried) == 0:
             return 0
@@ -662,6 +690,59 @@ class _CacheManager:
         await self._store(store_df, cols)
 
         return len(store_df)
+
+    @staticmethod
+    def _tickers_in(filter_sets: list[dict]) -> list[str]:
+        """Every ticker named across a set of planned fetches."""
+        tickers = set()
+        for filters in filter_sets:
+            value = filters.get('ticker')
+            if isinstance(value, list):
+                tickers.update(value)
+            elif value:
+                tickers.add(value)
+        return sorted(tickers)
+
+    def _covered_ranges(self, filter_sets: list[dict],
+                        eligible: set[str]) -> dict[str, tuple[str, str]]:
+        """
+        The date range each ticker is now covered for, having asked for it.
+
+        Coverage is what was *requested*, not what came back. A range with no
+        rows in it is still answered: the provider was asked and said there is
+        nothing there. Recording only the rows received leaves the empty parts
+        permanently unsatisfied, so a cache holding exactly what is asked for
+        still refetched the market holidays at either end on every call, and a
+        delisted ticker refetched a range that grew with every step of a walk.
+
+        This is the same idea the contiguous span already applies to holes in
+        the middle, which is why those never had the problem.
+
+        Only tickers in `eligible` get a range: ones this cache already holds
+        data for, or which returned some now. A ticker that has never returned
+        a row has no `lastupdated` watermark, so nothing could ever invalidate
+        a wrong guess about it, and it stays unrecorded on purpose.
+
+        The upper end is clamped by _update_sync_bounds against the provider's
+        delay, so the leading edge is never claimed and rolls forward.
+        """
+        date_col = self.table.date_column
+        if date_col is None:
+            return {}
+
+        ranges: dict[str, tuple[str, str]] = {}
+        for filters in filter_sets:
+            start = filters.get(f'{date_col}_gte')
+            end = filters.get(f'{date_col}_lte')
+            if not (start and end):
+                continue
+            for ticker in self._tickers_in([filters]):
+                if ticker not in eligible:
+                    continue
+                held = ranges.get(ticker)
+                ranges[ticker] = ((min(start, held[0]), max(end, held[1]))
+                                  if held else (start, end))
+        return ranges
 
     def _per_ticker_stats(self, queried: pd.DataFrame) -> dict[str, dict]:
         """Date range and max lastupdated per ticker in a fetched frame."""

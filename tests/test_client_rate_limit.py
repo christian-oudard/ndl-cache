@@ -11,7 +11,7 @@ from ndl_cache.async_client import (
     AsyncNDLClient, AuthenticationError, NDLError, RateLimitError,
     _is_rate_limit, _raise_for_error,
 )
-from ndl_cache.rate_limit import RateLimiter, Window
+from ndl_cache.rate_limit import MemoryCallLog, RateLimiter, Window
 
 
 class FakeClock:
@@ -353,3 +353,29 @@ class TestConnectionFailureRetry:
 
 async def _identity(value):
     return value
+
+
+class TestPageLimit:
+    """
+    A truncated result is not merely incomplete. The cache records what it
+    asked for as covered, so a silent truncation becomes a permanent hole that
+    the cache believes it has already filled.
+    """
+
+    async def test_running_past_the_page_limit_raises(self):
+        client = AsyncNDLClient(api_key='k', rate_limiter=RateLimiter(
+            windows=[], log=MemoryCallLog()))
+        pages = 0
+
+        async def endless(url, params=None):
+            nonlocal pages
+            pages += 1
+            return {'datatable': {'data': [['AAPL', 1.0]],
+                                  'columns': [{'name': 'ticker'},
+                                              {'name': 'close'}]},
+                    'meta': {'next_cursor_id': 'more'}}
+
+        client._request = endless
+        with pytest.raises(NDLError, match='pages'):
+            await client.get_table('SHARADAR/SEP', ticker='AAPL')
+        assert pages == client.PAGE_LIMIT
