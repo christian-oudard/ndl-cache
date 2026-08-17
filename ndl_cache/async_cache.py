@@ -731,6 +731,25 @@ class _CacheManager:
         queried = await self._fetch_parallel(filter_sets)
         ticker_stats = self._per_ticker_stats(queried)
 
+        # Rows first, coverage second, and never the other way round. A sync
+        # bound written for data that never landed is invisible: later reads
+        # return nothing, with no error and no refetch, because the cache
+        # believes the range is covered. Measured on a real cache, 107 of 264
+        # tickers in SEP claimed coverage with zero rows. Writing the rows
+        # first means a failure leaves the range unclaimed and it is fetched
+        # again.
+        stored = 0
+        if len(queried) > 0:
+            data_columns = [c for c in self.table.query_columns
+                            if c in queried.columns]
+            await self._ensure_data_table(data_columns)
+            cols = list(self.table.index_columns) + data_columns
+            # Dedupe in case API returns duplicate rows
+            store_df = queried[cols].drop_duplicates(
+                subset=list(self.table.index_columns))
+            await self._store(store_df, cols)
+            stored = len(store_df)
+
         for ticker, (start, end) in self._covered_ranges(
                 filter_sets, known | set(ticker_stats)).items():
             await self._update_sync_bounds(
@@ -747,19 +766,7 @@ class _CacheManager:
                     ticker, stats['min_date'], stats['max_date'],
                     stats.get('max_lastupdated'))
 
-        if len(queried) == 0:
-            return 0
-
-        data_columns = [c for c in self.table.query_columns if c in queried.columns]
-        await self._ensure_data_table(data_columns)
-
-        cols = list(self.table.index_columns) + data_columns
-        # Dedupe in case API returns duplicate rows
-        store_df = queried[cols].drop_duplicates(
-            subset=list(self.table.index_columns))
-        await self._store(store_df, cols)
-
-        return len(store_df)
+        return stored
 
     @staticmethod
     def _tickers_in(filter_sets: list[dict]) -> list[str]:

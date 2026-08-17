@@ -1314,3 +1314,57 @@ class TestUniverseIsFetchedWhenNeeded:
                              "WHERE ticker = 'FB'").fetchone()[0]
         conn.close()
         assert after == 0
+
+
+class TestCoverageNeverOutrunsData:
+    """
+    A sync bound written for data that never landed is invisible: later reads
+    return nothing, with no error and no refetch, because the cache believes
+    the range is covered. Measured on a real cache, 107 of 264 SEP tickers
+    claimed coverage with zero rows.
+    """
+
+    @staticmethod
+    async def fetch(client, table_name, columns=None, paginate=True,
+                    **filters):
+        return pd.DataFrame([
+            {'ticker': 'AAPL', 'date': d.date(), 'close': 1.0,
+             'lastupdated': pd.Timestamp('2020-05-01').date()}
+            for d in pd.bdate_range('2020-01-01', '2020-03-31')])
+
+    def bounds(self):
+        conn = duckdb.connect(get_db_path())
+        try:
+            return conn.execute(
+                'SELECT COUNT(*) FROM sharadar_sep_sync_bounds').fetchone()[0]
+        except duckdb.CatalogException:
+            return 0
+        finally:
+            conn.close()
+
+    def test_a_failed_write_leaves_the_range_unclaimed(self, use_temp_db):
+        async def explode(self, store_df, cols):
+            raise duckdb.IOException('disk full')
+
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch), \
+                patch.object(_CacheManager, '_store', explode):
+            with pytest.raises(duckdb.IOException):
+                query(SEP, ticker='AAPL',
+                      date_gte='2020-01-01', date_lte='2020-03-31')
+
+        assert self.bounds() == 0, 'coverage was claimed for data never written'
+
+    def test_the_range_is_refetched_afterwards(self, use_temp_db):
+        async def explode(self, store_df, cols):
+            raise duckdb.IOException('disk full')
+
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch), \
+                patch.object(_CacheManager, '_store', explode):
+            with pytest.raises(duckdb.IOException):
+                query(SEP, ticker='AAPL',
+                      date_gte='2020-01-01', date_lte='2020-03-31')
+
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            df = query(SEP, ticker='AAPL',
+                       date_gte='2020-01-01', date_lte='2020-03-31')
+        assert len(df) > 0
