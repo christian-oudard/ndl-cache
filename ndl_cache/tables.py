@@ -22,6 +22,12 @@ class TableDef:
     # Tables small enough to hold in full, refreshed no more often than this
     # many days. None means the table is synced per ticker instead.
     full_refresh_days: int | None = None
+    # Which universe in SHARADAR/TICKERS lists this table's symbols, used to
+    # spot a symbol that no longer exists. Must be table specific: FB is not
+    # an equity any more, but the symbol was reassigned to an ETF, so it is
+    # still present under SFP while Facebook's history moved to META.
+    # None means do not check.
+    tickers_table: str | None = None
 
     @property
     def all_columns(self) -> list[str]:
@@ -40,6 +46,7 @@ class TableDef:
 # Daily equity prices (stocks)
 SEP = TableDef(
     name='SHARADAR/SEP',
+    tickers_table='SEP',
     index_columns=('ticker', 'date'),
     query_columns=('open', 'high', 'low', 'close', 'volume', 'closeadj', 'closeunadj', 'lastupdated'),
     sync_delay_days=3,
@@ -53,6 +60,7 @@ SEP = TableDef(
 # Daily fund prices (ETFs, mutual funds)
 SFP = TableDef(
     name='SHARADAR/SFP',
+    tickers_table='SFP',
     index_columns=('ticker', 'date'),
     query_columns=('open', 'high', 'low', 'close', 'volume', 'closeadj', 'closeunadj', 'lastupdated'),
     sync_delay_days=3,
@@ -67,6 +75,7 @@ SFP = TableDef(
 # rows_per_year=None because actual rows depend heavily on dimension filter
 SF1 = TableDef(
     name='SHARADAR/SF1',
+    tickers_table='SF1',
     index_columns=('ticker', 'dimension', 'datekey'),
     date_column='calendardate',
     rows_per_year=None,
@@ -104,6 +113,7 @@ SF1 = TableDef(
 # Daily valuation metrics
 DAILY = TableDef(
     name='SHARADAR/DAILY',
+    tickers_table='SEP',
     index_columns=('ticker', 'date'),
     query_columns=('marketcap', 'ev', 'pb', 'pe', 'ps', 'lastupdated'),
     sync_delay_days=3,

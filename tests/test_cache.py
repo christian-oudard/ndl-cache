@@ -931,6 +931,9 @@ class TestStalenessCheck:
         """Serve DAILY rows whose lastupdated depends on how recent they are."""
         async def get_table(client, table_name, columns=None, paginate=True,
                             **filters):
+            if table_name == TICKERS.name:
+                return pd.DataFrame([{'table': 'SEP', 'ticker': 'AAPL',
+                                      'name': 'APPLE INC'}])
             calls.append(filters)
             span = filters.get('date', {})
             # No date filter means the whole history, which is what made the
@@ -1144,3 +1147,170 @@ class TestTablesWithoutAWatermark:
 
         assert not [c for c in calls if c.get('columns')
                     and 'lastupdated' in c['columns']]
+
+
+class TestRenamedSymbols:
+    """
+    When a company is renamed the provider moves its whole history to the new
+    symbol and the old one stops existing: SEP has no rows at all for FB, and
+    META carries them back to 2012. A cache filled before the rename keeps
+    serving the old copy, and nothing notices, because a probe for FB comes
+    back empty and empty reads as "nothing to report".
+    """
+
+    def fill(self, ticker):
+        async def get_table(client, table_name, columns=None, paginate=True,
+                            **filters):
+            if table_name == TICKERS.name:
+                return pd.DataFrame()
+            return pd.DataFrame([
+                {'ticker': ticker, 'date': d.date(), 'marketcap': 1.0,
+                 'lastupdated': pd.Timestamp('2020-05-01').date()}
+                for d in pd.bdate_range('2020-01-01', '2020-03-31')])
+
+        with patch.object(AsyncNDLClient, 'get_table', get_table):
+            query(DAILY, ticker=ticker,
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+
+    def list_symbols(self, symbols):
+        """Populate the cached tickers table. Entries are (table, ticker)."""
+        conn = duckdb.connect(get_db_path())
+        conn.execute('CREATE TABLE IF NOT EXISTS sharadar_tickers '
+                     '("table" VARCHAR, ticker VARCHAR, PRIMARY KEY '
+                     '("table", ticker))')
+        for entry in symbols:
+            universe, symbol = entry if isinstance(entry, tuple) else ('SEP', entry)
+            conn.execute('INSERT OR REPLACE INTO sharadar_tickers VALUES '
+                         '(?, ?)', [universe, symbol])
+        conn.execute('UPDATE sharadar_daily_sync_bounds SET '
+                     'last_staleness_check = last_staleness_check '
+                     '- INTERVAL 1 DAY')
+        conn.close()
+
+    def rows_for(self, ticker):
+        conn = duckdb.connect(get_db_path())
+        try:
+            return conn.execute('SELECT COUNT(*) FROM sharadar_daily '
+                                'WHERE ticker = ?', [ticker]).fetchone()[0]
+        finally:
+            conn.close()
+
+    def requery(self, ticker):
+        async def get_table(client, table_name, columns=None, paginate=True,
+                            **filters):
+            return pd.DataFrame()
+
+        with patch.object(AsyncNDLClient, 'get_table', get_table):
+            query(DAILY, ticker=ticker,
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+
+    def test_a_symbol_that_no_longer_exists_is_dropped(self, use_temp_db):
+        self.fill('FB')
+        assert self.rows_for('FB') > 0
+        self.list_symbols(['META', 'AAPL'])
+        self.requery('FB')
+        assert self.rows_for('FB') == 0
+
+    def test_a_listed_symbol_is_left_alone(self, use_temp_db):
+        self.fill('AAPL')
+        before = self.rows_for('AAPL')
+        self.list_symbols(['META', 'AAPL'])
+        self.requery('AAPL')
+        assert self.rows_for('AAPL') == before
+
+    def test_a_symbol_reassigned_to_another_universe_is_still_dropped(
+            self, use_temp_db):
+        # FB is a ProShares ETF now, listed under SFP in 2025, while
+        # Facebook's history moved to META. Asking whether the symbol exists
+        # anywhere answers yes, and leaves a decade of equity prices in place.
+        self.fill('FB')
+        assert self.rows_for('FB') > 0
+        self.list_symbols([('SFP', 'FB'), ('SEP', 'META')])
+        self.requery('FB')
+        assert self.rows_for('FB') == 0
+
+    def test_nothing_is_dropped_before_the_tickers_table_is_cached(
+            self, use_temp_db):
+        # Absence from a table that does not exist yet proves nothing.
+        self.fill('FB')
+        conn = duckdb.connect(get_db_path())
+        conn.execute('UPDATE sharadar_daily_sync_bounds SET '
+                     'last_staleness_check = last_staleness_check '
+                     '- INTERVAL 1 DAY')
+        conn.close()
+        self.requery('FB')
+        assert self.rows_for('FB') > 0
+
+
+class TestUniverseIsFetchedWhenNeeded:
+    """
+    The rename check compares against the tickers table, and nothing else
+    populates it. For anyone who only queries prices it was dead code.
+    """
+
+    def mock(self, universe):
+        async def get_table(client, table_name, columns=None, paginate=True,
+                            **filters):
+            if table_name == TICKERS.name:
+                return pd.DataFrame([{'table': u, 'ticker': t, 'name': t}
+                                     for u, t in universe])
+            named = filters['ticker']
+            named = named if isinstance(named, list) else [named]
+            # Only symbols still in this table's universe return rows. After
+            # a rename the provider has nothing under the old symbol at all.
+            listed = {t for u, t in universe if u == 'SEP'}
+            return pd.DataFrame([
+                {'ticker': t, 'date': d.date(), 'close': 1.0,
+                 'lastupdated': pd.Timestamp('2020-05-01').date()}
+                for t in named if t in listed
+                for d in pd.bdate_range('2020-01-01', '2020-03-31')])
+
+        return get_table
+
+    def test_a_price_query_populates_the_universe(self, use_temp_db):
+        # Not on the first query, which has nothing cached to be stale, but
+        # on the first one that runs a staleness check.
+        with patch.object(AsyncNDLClient, 'get_table',
+                          self.mock([('SEP', 'AAPL')])):
+            query(SEP, ticker='AAPL',
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+            conn = duckdb.connect(get_db_path())
+            conn.execute('UPDATE sharadar_sep_sync_bounds SET '
+                         'last_staleness_check = last_staleness_check '
+                         '- INTERVAL 1 DAY')
+            conn.close()
+            query(SEP, ticker='AAPL',
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+        conn = duckdb.connect(get_db_path())
+        names = [r[0] for r in conn.execute(
+            'SELECT table_name FROM information_schema.tables').fetchall()]
+        conn.close()
+        assert TICKERS.safe_table_name() in names
+
+    def test_a_rename_is_caught_without_ever_querying_tickers(self, use_temp_db):
+        # The whole point: a price-only workload still notices.
+        with patch.object(AsyncNDLClient, 'get_table',
+                          self.mock([('SEP', 'FB')])):
+            query(SEP, ticker='FB',
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+
+        conn = duckdb.connect(get_db_path())
+        before = conn.execute("SELECT COUNT(*) FROM sharadar_sep "
+                              "WHERE ticker = 'FB'").fetchone()[0]
+        conn.execute('UPDATE sharadar_sep_sync_bounds SET '
+                     'last_staleness_check = last_staleness_check '
+                     '- INTERVAL 1 DAY')
+        conn.close()
+        assert before > 0
+
+        # FB is reassigned to a fund; Facebook's history moved to META.
+        with patch.object(AsyncNDLClient, 'get_table',
+                          self.mock([('SFP', 'FB'), ('SEP', 'META')])):
+            query(SEP, ticker='FB',
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+
+        conn = duckdb.connect(get_db_path())
+        after = conn.execute("SELECT COUNT(*) FROM sharadar_sep "
+                             "WHERE ticker = 'FB'").fetchone()[0]
+        conn.close()
+        assert after == 0

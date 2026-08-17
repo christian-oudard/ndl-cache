@@ -15,7 +15,7 @@ import pandas as pd
 
 from .async_client import AsyncNDLClient, NDLError
 from .cover import solve_cover, find_gaps
-from .tables import TableDef, TRADING_DAYS_PER_YEAR
+from .tables import TableDef, TICKERS
 
 
 # Optimal parallelization level based on benchmarking ~10k row requests
@@ -445,7 +445,8 @@ class _CacheManager:
         # nothing to say about, so a check is not repeated within the day.
         await self._mark_checked(tickers_to_check, today)
 
-        for ticker in stale_tickers:
+        for ticker in set(stale_tickers) | set(
+                await self._renamed_away(tickers_to_check)):
             await self._invalidate_ticker(ticker)
 
     async def _mark_checked(self, tickers: list[str], today: str):
@@ -458,12 +459,81 @@ class _CacheManager:
             WHERE ticker IN ({placeholders})
         """, [today, *tickers])
 
-    async def _data_table_exists(self) -> bool:
+    async def _table_exists(self, name: str) -> bool:
         conn = await self._get_conn()
         cursor = await conn.execute(
             'SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?',
-            [self.table.safe_table_name()])
+            [name])
         return (await cursor.fetchone())[0] > 0
+
+    async def _data_table_exists(self) -> bool:
+        return await self._table_exists(self.table.safe_table_name())
+
+    async def _ensure_universe(self):
+        """
+        Make sure the tickers table is on hand, since it is what says whether
+        a symbol still exists.
+
+        Without this the rename check is dead code for anyone who only ever
+        queries prices: nothing else populates that table, so the comparison
+        silently finds nothing, forever. It refreshes at most daily and the
+        warm case is a local read, so the cost is one fetch a day.
+
+        Best effort on purpose. This is a check running alongside somebody
+        else's query, so failing to fetch it should leave the check undone,
+        not fail the price query that happened to trigger it.
+
+        Runs on this manager's own connection. A second connection to the same
+        file works, but the write lands outside this one's snapshot, so the
+        table it just created is invisible here and the check quietly finds
+        nothing.
+        """
+        universe = _CacheManager(TICKERS)
+        universe._conn = self._conn
+        universe._ndl_client = await self._get_ndl_client()
+        try:
+            await universe._sync_full_table()
+        except Exception:
+            pass
+        finally:
+            # Borrowed, so neither is this manager's to close.
+            universe._conn = None
+            universe._ndl_client = None
+
+    async def _renamed_away(self, tickers: list[str]) -> list[str]:
+        """
+        Tickers holding cached rows whose symbol no longer exists.
+
+        When a company is renamed the provider moves its entire history to the
+        new symbol and the old one stops existing: SEP has no rows at all for
+        FB, and META carries them back to 2012. A cache filled before the
+        rename keeps serving the old copy forever, and nothing else notices,
+        because a probe for FB comes back empty and empty reads as "nothing to
+        report" rather than "this symbol is gone".
+
+        Detected against the cached tickers table, so it costs no request. The
+        old name is recoverable from the ACTIONS row `tickerchangefrom`, whose
+        `contraticker` holds it.
+
+        The lookup has to be restricted to this table's own universe, because
+        symbols are reassigned across them. FB is a ProShares ETF now, listed
+        under SFP in 2025, so asking whether the symbol exists anywhere would
+        answer yes and leave a decade of Facebook prices sitting in the equity
+        cache.
+        """
+        if not tickers or self.table.tickers_table is None:
+            return []
+        await self._ensure_universe()
+        if not await self._table_exists(TICKERS.safe_table_name()):
+            return []
+        conn = await self._get_conn()
+        placeholders = ', '.join(['?'] * len(tickers))
+        cursor = await conn.execute(f"""
+            SELECT DISTINCT ticker FROM {TICKERS.safe_table_name()}
+            WHERE "table" = ? AND ticker IN ({placeholders})
+        """, [self.table.tickers_table, *tickers])
+        listed = {row[0] for row in await cursor.fetchall()}
+        return [t for t in tickers if t not in listed]
 
     def _estimate_rows_for_range(self, date_gte: str | None, date_lte: str | None) -> int:
         """Estimate number of rows per ticker for a date range."""
