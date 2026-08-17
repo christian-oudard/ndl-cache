@@ -19,17 +19,10 @@ from .cover import solve_cover, find_gaps
 from .tables import TableDef, TICKERS
 
 
-# Optimal parallelization level based on benchmarking ~10k row requests
-# Nasdaq's Tables API allows an authenticated key one call in flight plus one
-# queued, so extra workers cannot make progress and only risk tripping the
-# concurrency limit. The client's rate limiter enforces this with a semaphore;
-# this bound just avoids queueing work that can never run in parallel.
-MAX_FETCH_WORKERS = int(os.environ.get('NDL_MAX_CONCURRENCY', 2))
+# Concurrency is enforced by the rate limiter's semaphore, which is the only
+# thing that can satisfy a limit counted in open calls rather than in a rate.
 
-# NDL API page limit
-NDL_PAGE_LIMIT = 10000
-
-# Split threshold - stay well under page limit
+# Rows per request, kept well under the provider's ten thousand row page.
 NDL_SPLIT_THRESHOLD = 9000
 
 # Requests are also bounded by URL length, independently of row count. A query
@@ -1106,47 +1099,6 @@ class _CacheManager:
 
         return df
 
-    def _find_tickers_with_gaps(self, df: pd.DataFrame, gap_threshold_days: int = 14) -> list[str]:
-        """Find tickers with date gaps larger than threshold in cached data.
-
-        This is a quick check on already-loaded data to detect corrupted cache entries.
-        """
-        if df.empty or self.table.date_column is None:
-            return []
-
-        date_col = self.table.date_column
-        if date_col not in df.index.names:
-            return []
-
-        tickers_with_gaps = []
-
-        # Get unique tickers from the index
-        if 'ticker' in df.index.names:
-            ticker_level = df.index.names.index('ticker')
-            unique_tickers = df.index.get_level_values(ticker_level).unique()
-
-            for ticker in unique_tickers:
-                try:
-                    ticker_data = df.loc[ticker] if ticker_level == 0 else df.xs(ticker, level='ticker')
-                    if isinstance(ticker_data, pd.Series):
-                        continue  # Only one row, no gaps possible
-
-                    dates = ticker_data.index.get_level_values(date_col) if date_col in ticker_data.index.names else None
-                    if dates is None or len(dates) < 2:
-                        continue
-
-                    # Sort dates and check for gaps
-                    sorted_dates = sorted(dates)
-                    for i in range(1, len(sorted_dates)):
-                        gap = (sorted_dates[i] - sorted_dates[i-1]).days
-                        if gap > gap_threshold_days:
-                            tickers_with_gaps.append(ticker)
-                            break
-                except (KeyError, TypeError):
-                    continue
-
-        return tickers_with_gaps
-
     async def query(self, columns: list[str] | str | None = None, **filters) -> pd.DataFrame:
         """Query data from cache, fetching from NDL if not cached."""
         ticker_filter = filters.get('ticker')
@@ -1208,28 +1160,6 @@ class _CacheManager:
                         await self._sync_parallel([{'ticker': t} for t in unsynced])
 
             result = await self.get_cached(**filters)
-
-            # Quick gap check: if any tickers have large date gaps, invalidate and re-fetch
-            if not result.empty and self.table.date_column:
-                tickers_with_gaps = self._find_tickers_with_gaps(result)
-                if tickers_with_gaps:
-                    # Invalidate corrupted tickers and re-fetch
-                    for ticker in tickers_with_gaps:
-                        await self._invalidate_ticker(ticker)
-
-                    # Re-run sync for the corrupted tickers
-                    date_gte = filters.get(f'{self.table.date_column}_gte')
-                    date_lte = filters.get(f'{self.table.date_column}_lte')
-                    if date_gte and date_lte:
-                        refetch_filters = [{
-                            'ticker': tickers_with_gaps,
-                            f'{self.table.date_column}_gte': date_gte,
-                            f'{self.table.date_column}_lte': date_lte,
-                        }]
-                        await self._sync_parallel(refetch_filters)
-
-                    # Re-fetch from cache
-                    result = await self.get_cached(**filters)
 
         return self._select_columns(result, columns)
 

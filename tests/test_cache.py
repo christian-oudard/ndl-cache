@@ -1607,3 +1607,45 @@ class TestReadOnlyMode:
             assert len(df) > 0
         finally:
             other.close()
+
+
+class TestRealHolesAreNotCorruption:
+    """
+    A gap in the data is not evidence of a broken cache. Trading halts,
+    suspensions and relistings leave real holes, and a heuristic that treats
+    them as damage deletes the ticker, refetches, gets the same hole back and
+    does it again on the next query.
+    """
+
+    @staticmethod
+    async def fetch(client, table_name, columns=None, paginate=True, **filters):
+        # Suspended for all of February, which is a real hole, not a bad write.
+        dates = [d for d in pd.bdate_range('2020-01-02', '2020-03-31')
+                 if not ('2020-02-01' <= str(d.date()) <= '2020-02-29')]
+        return pd.DataFrame([
+            {'ticker': 'HALT', 'date': d.date(), 'close': 1.0,
+             'lastupdated': pd.Timestamp('2020-05-01').date()} for d in dates])
+
+    def test_a_suspended_ticker_is_not_refetched_every_time(self, use_temp_db):
+        calls = []
+
+        async def counted(client, table_name, columns=None, paginate=True, **f):
+            calls.append(f)
+            return await TestRealHolesAreNotCorruption.fetch(
+                client, table_name, columns, paginate, **f)
+
+        with patch.object(AsyncNDLClient, 'get_table', counted):
+            query(SEP, ticker='HALT',
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+            calls.clear()
+            query(SEP, ticker='HALT',
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+        assert calls == [], 'a real hole triggered a refetch that cannot fix it'
+
+    def test_the_hole_survives_rather_than_being_deleted(self, use_temp_db):
+        with patch.object(AsyncNDLClient, 'get_table', self.fetch):
+            query(SEP, ticker='HALT',
+                  date_gte='2020-01-01', date_lte='2020-03-31')
+            df = query(SEP, ticker='HALT',
+                       date_gte='2020-01-01', date_lte='2020-03-31')
+        assert len(df) > 0, 'the ticker was deleted for having a real hole'
