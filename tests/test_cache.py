@@ -914,3 +914,96 @@ class TestWholeTableCache:
         df = query(TICKERS)
         assert len(calls) == 2
         assert 'SPY' not in set(df.index.get_level_values('ticker'))
+
+
+class TestStalenessCheck:
+    """
+    Sharadar restates a ticker by rewriting `lastupdated` on every row it
+    holds for it: MSFT carries one value, 2026-05-21, across 1999 to 2024.
+    Only the most recent weeks carry per-row stamps from daily ingest.
+    """
+
+    HELD = ('2020-01-01', '2020-03-31')
+    TODAY = '2026-08-10'
+
+    def mock(self, calls, restated=False):
+        """Serve DAILY rows whose lastupdated depends on how recent they are."""
+        async def get_table(client, table_name, columns=None, paginate=True,
+                            **filters):
+            calls.append(filters)
+            span = filters.get('date', {})
+            # No date filter means the whole history, which is what made the
+            # old probe expensive and what made its comparison wrong.
+            start = span.get('gte', '2020-01-01')
+            end = span.get('lte', self.TODAY)
+            tickers = filters.get('ticker') or ['AAPL']
+            if isinstance(tickers, str):
+                tickers = [tickers]
+            dates = pd.bdate_range(start, end)
+            rows = []
+            for ticker in tickers:
+                for date in dates:
+                    # Settled history carries one restatement watermark;
+                    # recent rows are stamped as they arrive.
+                    if date < pd.Timestamp('2026-07-01'):
+                        stamp = '2026-05-22' if restated else '2020-04-02'
+                    else:
+                        stamp = str(date.date())
+                    rows.append({'ticker': ticker, 'date': date.date(),
+                                 'marketcap': 1.0,
+                                 'lastupdated': pd.Timestamp(stamp).date()})
+            return pd.DataFrame(rows)
+
+        return get_table
+
+    def fill_then_query_next_day(self, restated):
+        """Cache a historical slice, then re-query it a day later."""
+        calls = []
+        with patch.object(AsyncNDLClient, 'get_table', self.mock(calls)):
+            query(DAILY, ticker='AAPL',
+                  date_gte=self.HELD[0], date_lte=self.HELD[1])
+
+        conn = duckdb.connect(get_db_path())
+        conn.execute('UPDATE sharadar_daily_sync_bounds '
+                     'SET last_staleness_check = last_staleness_check '
+                     '- INTERVAL 1 DAY')
+        conn.close()
+
+        calls.clear()
+        dropped = []
+        original = _CacheManager._invalidate_ticker
+
+        async def track(self, ticker):
+            dropped.append(ticker)
+            return await original(self, ticker)
+
+        with patch.object(AsyncNDLClient, 'get_table',
+                          self.mock(calls, restated=restated)), \
+                patch.object(_CacheManager, '_invalidate_ticker', track):
+            query(DAILY, ticker='AAPL',
+                  date_gte=self.HELD[0], date_lte=self.HELD[1])
+        return calls, dropped
+
+    def test_a_historical_slice_is_not_thrown_away_daily(self, use_temp_db):
+        # The provider always holds rows newer than a historical cache does,
+        # stamped more recently. Taking the watermark over all of history
+        # therefore said "stale" every day, and the whole ticker was deleted
+        # and refetched on the first query of each one.
+        _, dropped = self.fill_then_query_next_day(restated=False)
+        assert dropped == []
+
+    def test_the_watermark_is_read_from_a_short_window(self, use_temp_db):
+        # Reading it from the whole history cost a hundred pages per check.
+        calls, _ = self.fill_then_query_next_day(restated=False)
+        spans = [(c['date']['gte'], c['date']['lte'])
+                 for c in calls if 'date' in c]
+        assert len(spans) == len(calls), 'every request must be date bounded'
+        widest = max((pd.Timestamp(hi) - pd.Timestamp(lo)).days
+                     for lo, hi in spans)
+        assert widest < 7
+
+    def test_a_real_restatement_still_invalidates(self, use_temp_db):
+        # The point of the check: when the settled history is rewritten, the
+        # cached copy is wrong and has to go.
+        _, dropped = self.fill_then_query_next_day(restated=True)
+        assert dropped == ['AAPL']
