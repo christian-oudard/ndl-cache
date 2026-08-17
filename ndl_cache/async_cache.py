@@ -558,32 +558,11 @@ class _CacheManager:
         if not filter_sets:
             return 0
 
-        conn = await self._get_conn()
         queried = await self._fetch_parallel(filter_sets)
 
         # Extract actual date ranges and max_lastupdated per ticker from returned data
         # This ensures sync bounds reflect what was actually stored, not what was requested
-        ticker_stats: dict[str, dict] = {}
-        if len(queried) > 0:
-            date_col = self.table.date_column
-            for ticker in queried['ticker'].unique():
-                ticker_data = queried[queried['ticker'] == ticker]
-                stats: dict = {}
-
-                if 'lastupdated' in ticker_data.columns:
-                    max_lu = ticker_data['lastupdated'].max()
-                    if pd.notna(max_lu):
-                        stats['max_lastupdated'] = str(max_lu)[:10]
-
-                if date_col and date_col in ticker_data.columns:
-                    min_date = ticker_data[date_col].min()
-                    max_date = ticker_data[date_col].max()
-                    if pd.notna(min_date) and pd.notna(max_date):
-                        stats['min_date'] = str(min_date)[:10]
-                        stats['max_date'] = str(max_date)[:10]
-
-                if stats:
-                    ticker_stats[ticker] = stats
+        ticker_stats = self._per_ticker_stats(queried)
 
         # Update sync bounds based on ACTUAL data received, not requested ranges
         for ticker, stats in ticker_stats.items():
@@ -603,25 +582,60 @@ class _CacheManager:
         data_columns = [c for c in self.table.query_columns if c in queried.columns]
         await self._ensure_data_table(data_columns)
 
-        store_df = queried[list(self.table.index_columns) + data_columns].copy()
-
-        # Insert rows using executemany for aioduckdb compatibility
         cols = list(self.table.index_columns) + data_columns
-        placeholders = ', '.join(['?'] * len(cols))
-        col_names = ', '.join(cols)
-
         # Dedupe in case API returns duplicate rows
-        store_df = store_df.drop_duplicates(subset=list(self.table.index_columns))
-        rows = [tuple(row) for row in store_df.itertuples(index=False, name=None)]
-
-        # Use INSERT OR REPLACE to handle duplicates from parallel queries or retries.
-        # This prevents constraint errors when overlapping data is fetched multiple times.
-        await conn.executemany(f"""
-            INSERT OR REPLACE INTO {self.table.safe_table_name()} ({col_names})
-            VALUES ({placeholders})
-        """, rows)
+        store_df = queried[cols].drop_duplicates(
+            subset=list(self.table.index_columns))
+        await self._store(store_df, cols)
 
         return len(store_df)
+
+    def _per_ticker_stats(self, queried: pd.DataFrame) -> dict[str, dict]:
+        """Date range and max lastupdated per ticker in a fetched frame."""
+        if len(queried) == 0:
+            return {}
+
+        wanted = {}
+        if 'lastupdated' in queried.columns:
+            wanted['max_lastupdated'] = ('lastupdated', 'max')
+        date_col = self.table.date_column
+        if date_col and date_col in queried.columns:
+            wanted['min_date'] = (date_col, 'min')
+            wanted['max_date'] = (date_col, 'max')
+        if not wanted:
+            return {}
+
+        grouped = queried.groupby('ticker').agg(**wanted)
+        return {
+            ticker: {k: str(v)[:10] for k, v in row.items() if pd.notna(v)}
+            for ticker, row in grouped.to_dict('index').items()
+        }
+
+    async def _store(self, store_df: pd.DataFrame, cols: list[str]):
+        """
+        Write a frame into the data table.
+
+        Registered as a view and inserted in one statement rather than row by
+        row. DuckDB is columnar, and an executemany of INSERT OR REPLACE pays
+        a separate statement and index probe per row: writing one month of
+        prices for 500 tickers that way took twenty seconds, and got slower as
+        the table grew, which is most of what made a warm cache feel slow.
+
+        INSERT OR REPLACE because parallel fetches and retries overlap, and
+        the same row can legitimately arrive twice.
+        """
+        conn = await self._get_conn()
+        col_names = ', '.join(cols)
+        await conn.register('_incoming', store_df)
+        try:
+            # execute_on_self, not execute: the latter runs on a fresh cursor,
+            # which aioduckdb duplicates from the connection and which
+            # therefore cannot see anything registered on it.
+            await conn.execute_on_self(
+                f'INSERT OR REPLACE INTO {self.table.safe_table_name()} '
+                f'({col_names}) SELECT {col_names} FROM _incoming')
+        finally:
+            await conn.unregister('_incoming')
 
     async def get_cached(self, **filters) -> pd.DataFrame:
         """Get data from local cache."""
