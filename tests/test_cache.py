@@ -1419,6 +1419,20 @@ class TestValidateSyncBounds:
     def test_an_empty_cache_reports_nothing(self, use_temp_db):
         assert validate_sync_bounds(SEP) == []
 
+    def test_inspecting_does_not_take_the_write_lock(self, use_temp_db):
+        # Looking at a cache should not stop anything else looking at it.
+        # DuckDB refuses a read-only connection alongside a read-write one,
+        # so opening it for writing just to inspect locks out every reader.
+        self.fill()
+        held = duckdb.connect(get_db_path(), read_only=True)
+        try:
+            assert validate_sync_bounds(SEP) == []
+        finally:
+            held.close()
+
+    def test_a_missing_cache_file_reports_nothing(self, use_temp_db):
+        assert validate_sync_bounds(SEP) == []
+
 
 class TestWholeTableReplacement:
     """

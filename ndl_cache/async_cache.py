@@ -1227,6 +1227,10 @@ async def async_validate_sync_bounds(
     data is normal and is not reported. Holding *nothing* is not, because a
     range is only ever recorded for a ticker that returned rows.
 
+    Opened read-only unless asked to fix, so inspecting never takes the write
+    lock and any number of readers can look at once. It does not let you read
+    a cache another process holds for writing; DuckDB refuses that either way.
+
     Args:
         table: Table definition (e.g., SEP, SFP)
         fix: If True, drop the claim so the range is fetched again
@@ -1240,7 +1244,10 @@ async def async_validate_sync_bounds(
         for ticker in validate_sync_bounds(SEP, fix=True):
             print(f'{ticker} claimed coverage with no rows')
     """
-    conn = duckdb.connect(get_db_path())
+    db_path = get_db_path()
+    if not Path(db_path).exists():
+        return []
+    conn = duckdb.connect(db_path, read_only=not fix)
     try:
         data_table = table.safe_table_name()
         sync_table = table.sync_bounds_table_name()
