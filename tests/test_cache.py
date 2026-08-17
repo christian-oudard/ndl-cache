@@ -4,6 +4,8 @@ Tests for ndl-cache caching layer.
 These tests mock the async NDL client to avoid network calls.
 """
 import json
+import warnings
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1649,3 +1651,62 @@ class TestRealHolesAreNotCorruption:
             df = query(SEP, ticker='HALT',
                        date_gte='2020-01-01', date_lte='2020-03-31')
         assert len(df) > 0, 'the ticker was deleted for having a real hole'
+
+
+class TestDtypes:
+    """
+    What a column holds should not depend on which chunk it arrived in, or on
+    whether the provider sent a number as a float, a Decimal or a string. A
+    Decimal arriving where a float was expected has crashed a caller before.
+    """
+
+    def mock(self, close_values):
+        async def get_table(client, table_name, columns=None, paginate=True,
+                            **filters):
+            dates = pd.bdate_range('2020-01-02', '2020-01-08')
+            return pd.DataFrame([
+                {'ticker': 'AAPL', 'date': str(d.date()),
+                 'close': close_values[i % len(close_values)],
+                 'volume': None,
+                 'lastupdated': '2020-05-01'}
+                for i, d in enumerate(dates)])
+
+        return get_table
+
+    def fetched(self, close_values):
+        with patch.object(AsyncNDLClient, 'get_table', self.mock(close_values)):
+            return query(SEP, ticker='AAPL',
+                         date_gte='2020-01-01', date_lte='2020-01-31')
+
+    def test_decimals_do_not_reach_the_caller(self, use_temp_db):
+        df = self.fetched([Decimal('1.5'), Decimal('2.5')])
+        assert df['close'].dtype == 'float64', df['close'].dtype
+        assert not any(isinstance(v, Decimal) for v in df['close'])
+
+    def test_numbers_sent_as_strings_are_numbers(self, use_temp_db):
+        df = self.fetched(['1.5', '2.5'])
+        assert df['close'].dtype == 'float64', df['close'].dtype
+
+    def test_an_all_null_column_is_still_numeric(self, use_temp_db):
+        # Nothing in the column says what it is, so it must come from the
+        # table definition rather than from whatever arrived.
+        df = self.fetched([1.5])
+        assert df['volume'].dtype == 'float64', df['volume'].dtype
+
+    def test_a_mixture_settles_on_one_type(self, use_temp_db):
+        df = self.fetched([Decimal('1.5'), 2.5, '3.5', None])
+        assert df['close'].dtype == 'float64', df['close'].dtype
+
+    def test_concatenating_chunks_warns_about_nothing(self, use_temp_db):
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', FutureWarning)
+            self.fetched([1.5, 2.5])
+
+    def test_a_bypassed_cache_returns_the_same_types(self, use_temp_db,
+                                                     monkeypatch):
+        # NDL_CACHE_DISABLED hands back what the provider sent without a round
+        # trip through DuckDB, which is what used to coerce it.
+        monkeypatch.setenv('NDL_CACHE_DISABLED', '1')
+        df = self.fetched([Decimal('1.5'), Decimal('2.5')])
+        assert df['close'].dtype == 'float64', df['close'].dtype
+        assert not any(isinstance(v, Decimal) for v in df['close'])

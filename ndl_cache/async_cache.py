@@ -96,6 +96,17 @@ class QueryPlan:
         return self.requests == 0
 
 
+def _env_flag(name: str) -> bool:
+    """
+    Read a boolean environment variable.
+
+    Read on each call rather than cached. It is one dictionary lookup, and a
+    value captured at import cannot be changed by a caller that imports this
+    module first, which is exactly the defect MAX_FETCH_WORKERS had.
+    """
+    return os.environ.get(name, '').lower() in ('1', 'true', 'yes')
+
+
 def is_read_only() -> bool:
     """
     Whether to open the cache without contending for the write lock.
@@ -104,12 +115,12 @@ def is_read_only() -> bool:
     several analysis processes can share one cache file. It does not let you
     read while another process writes; DuckDB refuses that either way.
     """
-    return os.environ.get('NDL_CACHE_READ_ONLY', '').lower() in ('1', 'true', 'yes')
+    return _env_flag('NDL_CACHE_READ_ONLY')
 
 
 def is_cache_disabled() -> bool:
-    """Check if cache is disabled via environment variable."""
-    return os.environ.get('NDL_CACHE_DISABLED', '').lower() in ('1', 'true', 'yes')
+    """Whether to bypass the cache and go straight to the provider."""
+    return _env_flag('NDL_CACHE_DISABLED')
 
 
 def get_db_path() -> str:
@@ -1103,11 +1114,33 @@ class _CacheManager:
         df = pd.DataFrame(rows, columns=columns)
 
         if len(df) > 0:
-            for col in self.table.index_columns:
-                if self.table.column_types.get(col) == 'DATE':
-                    df[col] = pd.to_datetime(df[col])
+            df = self._normalise(df)
             df = df.set_index(list(self.table.index_columns))
 
+        return df
+
+    def _normalise(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Give each column the type the table declares, whatever arrived.
+
+        Otherwise what a column holds depends on how it travelled. A column
+        that is entirely null comes back from DuckDB as objects holding None,
+        because nothing in the values says what it is; and with the cache
+        bypassed there is no round trip through DuckDB to coerce anything at
+        all, so a Decimal the provider sent reaches the caller as a Decimal.
+        Arithmetic on either one fails somewhere far from here.
+
+        Numbers are converted strictly, so a value that is not a number in a
+        column declared numeric raises rather than turning quietly into NaN.
+        """
+        for col in df.columns:
+            declared = self.table.column_types.get(col, 'DOUBLE')
+            if declared == 'VARCHAR':
+                continue
+            if declared == 'DATE':
+                df[col] = pd.to_datetime(df[col])
+            else:
+                df[col] = pd.to_numeric(df[col])
         return df
 
     async def query(self, columns: list[str] | str | None = None, **filters) -> pd.DataFrame:
@@ -1126,6 +1159,7 @@ class _CacheManager:
                 fetch_filters['ticker'] = tickers
                 result = await self._fetch_parallel([fetch_filters])
                 if not result.empty and self.table.index_columns:
+                    result = self._normalise(result)
                     index_cols = [c for c in self.table.index_columns if c in result.columns]
                     if index_cols:
                         result = result.set_index(index_cols)
