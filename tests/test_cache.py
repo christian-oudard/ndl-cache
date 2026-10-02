@@ -1669,8 +1669,8 @@ class TestExplain:
 
 class TestReadOnlyMode:
     """
-    DuckDB takes an exclusive lock, so one writer blocks every reader. A
-    read-only connection lets several analysis processes share a cache.
+    A read-only process serves what is cached and never syncs, and shares
+    the cache with other read-only processes.
     """
 
     @staticmethod

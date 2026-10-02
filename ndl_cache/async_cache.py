@@ -17,6 +17,7 @@ import pandas as pd
 
 from .async_client import AsyncNDLClient, NDLError
 from .cover import solve_cover, find_gaps
+from .file_lock import FileLock
 from .tables import TableDef, TICKERS
 
 
@@ -109,11 +110,11 @@ def _env_flag(name: str) -> bool:
 
 def is_read_only() -> bool:
     """
-    Whether to open the cache without contending for the write lock.
+    Whether to open the cache read-only.
 
-    A read-only connection serves whatever is cached and never syncs, so
-    several analysis processes can share one cache file. It does not let you
-    read while another process writes; DuckDB refuses that either way.
+    A read-only process serves whatever is cached and never syncs. Read-only
+    processes share the cache's file lock, so they read at the same time as
+    one another, and wait only while a writer is in the file.
     """
     return _env_flag('NDL_CACHE_READ_ONLY')
 
@@ -167,16 +168,28 @@ class _CacheManager:
         self._db_path = get_db_path()
         self._conn: aioduckdb.Connection | None = None
         self._ndl_client: AsyncNDLClient | None = None
+        # Held exactly while _conn is open; see file_lock.
+        self._lock = FileLock(self._db_path + '.lock')
 
     async def _get_conn_without_init(self) -> aioduckdb.Connection:
         """Get or create connection without table initialization.
 
-        Retries with backoff to handle Windows file lock delays when a previous
-        process recently closed the database.
+        Takes the cache's file lock first, so another process's connection is
+        never in the way. Retries with backoff to handle Windows file lock
+        delays when a previous process recently closed the database.
         """
         if self._conn is not None:
             return self._conn
 
+        await self._lock.acquire(shared=is_read_only())
+        try:
+            return await self._connect()
+        except BaseException:
+            self._lock.release()
+            raise
+
+    async def _connect(self) -> aioduckdb.Connection:
+        """Open the file, with the lock already held."""
         max_retries = 5
         base_delay = 0.1  # 100ms initial delay
         last_error = None
@@ -196,7 +209,9 @@ class _CacheManager:
                 wal_file = Path(self._db_path + '.wal')
                 if wal_file.exists():
                     raise duckdb.IOException(
-                        f"Database is locked. Only one process can access the cache at a time.\n"
+                        f"Database is locked by a process that does not take "
+                        f"{self._lock.path}: an older ndl-cache, or a direct "
+                        f"DuckDB connection.\n"
                         f"If no other process is running, delete stale lock files:\n"
                         f"  rm {self._db_path}.wal*"
                     ) from e
@@ -226,11 +241,28 @@ class _CacheManager:
             self._ndl_client = AsyncNDLClient()
         return self._ndl_client
 
+    async def _release(self):
+        """Close the file and let other processes have it."""
+        try:
+            if self._conn is not None:
+                await self._conn.close()
+                self._conn = None
+        finally:
+            self._lock.release()
+
+    @asynccontextmanager
+    async def _unlocked(self):
+        """
+        Let go of the cache for the length of a provider call, which can take
+        minutes, so other processes can read and write it meanwhile. The next
+        _get_conn takes it back.
+        """
+        await self._release()
+        yield
+
     async def close(self):
         """Close connections."""
-        if self._conn is not None:
-            await self._conn.close()
-            self._conn = None
+        await self._release()
         if self._ndl_client is not None:
             await self._ndl_client.close()
             self._ndl_client = None
@@ -460,7 +492,6 @@ class _CacheManager:
         if not tickers:
             return
 
-        conn = await self._get_conn()
         today = datetime.now().strftime('%Y-%m-%d')
         sync_bounds = await self._get_sync_bounds(tickers)
 
@@ -493,13 +524,14 @@ class _CacheManager:
                 await self._probe_windows(tickers_to_check, sync_bounds)).items():
             date_col = self.table.date_column
             try:
-                df = await client.get_table(
-                    self.table.name,
-                    columns=['ticker', 'lastupdated'],
-                    ticker=group,
-                    paginate=True,
-                    **{date_col: {'gte': start, 'lte': end}},
-                )
+                async with self._unlocked():
+                    df = await client.get_table(
+                        self.table.name,
+                        columns=['ticker', 'lastupdated'],
+                        ticker=group,
+                        paginate=True,
+                        **{date_col: {'gte': start, 'lte': end}},
+                    )
             except Exception:
                 # On error, skip staleness check but still update last_staleness_check
                 continue
@@ -586,22 +618,21 @@ class _CacheManager:
         else's query, so failing to fetch it should leave the check undone,
         not fail the price query that happened to trigger it.
 
-        Runs on this manager's own connection. A second connection to the same
-        file works, but the write lands outside this one's snapshot, so the
-        table it just created is invisible here and the check quietly finds
-        nothing.
+        Runs while this manager has let go of the cache, so the universe's own
+        connection can write, and this manager's next connection sees what it
+        wrote.
         """
         universe = _CacheManager(TICKERS)
-        universe._conn = self._conn
         universe._ndl_client = await self._get_ndl_client()
-        try:
-            await universe._sync_full_table()
-        except Exception:
-            pass
-        finally:
-            # Borrowed, so neither is this manager's to close.
-            universe._conn = None
-            universe._ndl_client = None
+        async with self._unlocked():
+            try:
+                await universe._sync_full_table()
+            except Exception:
+                pass
+            finally:
+                await universe._release()
+                # Borrowed, so not the universe's to close.
+                universe._ndl_client = None
 
     async def _renamed_away(self, tickers: list[str]) -> list[str]:
         """
@@ -882,7 +913,8 @@ class _CacheManager:
         known = {t for t, b in (await self._get_sync_bounds(
             self._tickers_in(filter_sets))).items() if b is not None}
 
-        queried = await self._fetch_parallel(filter_sets)
+        async with self._unlocked():
+            queried = await self._fetch_parallel(filter_sets)
         ticker_stats = self._per_ticker_stats(queried)
 
         # Rows first, coverage second, and never the other way round. A sync
@@ -1070,8 +1102,9 @@ class _CacheManager:
                 return
 
         client = await self._get_ndl_client()
-        fetched = await client.get_table(
-            self.table.name, columns=self.table.all_columns, paginate=True)
+        async with self._unlocked():
+            fetched = await client.get_table(
+                self.table.name, columns=self.table.all_columns, paginate=True)
         if len(fetched) == 0:
             raise NDLError(f'{self.table.name} returned no rows')
 
