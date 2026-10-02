@@ -3,6 +3,7 @@ Tests for ndl-cache caching layer.
 
 These tests mock the async NDL client to avoid network calls.
 """
+import asyncio
 import json
 import warnings
 from decimal import Decimal
@@ -923,61 +924,75 @@ class TestWholeTableCache:
 
 class TestStalenessCheck:
     """
-    Sharadar restates a ticker by rewriting `lastupdated` on every row it
-    holds for it: MSFT carries one value, 2026-05-21, across 1999 to 2024.
-    Only the most recent weeks carry per-row stamps from daily ingest.
+    Sharadar rewrites rows in place and stamps each one it touches with a new
+    `lastupdated`: a restatement stamps a ticker's whole history, and a
+    correction stamps only the rows it fixed, which can lie years back. Once a
+    day the cache asks for each ticker's rows stamped since it last asked.
     """
 
     HELD = ('2020-01-01', '2020-03-31')
-    TODAY = '2026-08-10'
 
-    def mock(self, calls, restated=False):
-        """Serve DAILY rows whose lastupdated depends on how recent they are."""
+    def provider(self):
+        """A ticker's history as the provider holds it, settled long ago."""
+        return pd.DataFrame([
+            {'ticker': 'AAPL', 'date': d.date(), 'marketcap': 1.0,
+             'lastupdated': pd.Timestamp('2020-04-02').date()}
+            for d in pd.bdate_range('2020-01-01', '2020-12-31')])
+
+    @staticmethod
+    def serve(held, calls, fail_probes=False):
+        """Answer requests from `held`, filtered as the provider would."""
         async def get_table(client, table_name, columns=None, paginate=True,
                             **filters):
             if table_name == TICKERS.name:
                 return pd.DataFrame([{'table': 'SEP', 'ticker': 'AAPL',
                                       'name': 'APPLE INC'}])
             calls.append(filters)
-            span = filters.get('date', {})
-            # No date filter means the whole history, which is what made the
-            # old probe expensive and what made its comparison wrong.
-            start = span.get('gte', '2020-01-01')
-            end = span.get('lte', self.TODAY)
-            tickers = filters.get('ticker') or ['AAPL']
-            if isinstance(tickers, str):
-                tickers = [tickers]
-            dates = pd.bdate_range(start, end)
-            rows = []
-            for ticker in tickers:
-                for date in dates:
-                    # Settled history carries one restatement watermark;
-                    # recent rows are stamped as they arrive.
-                    if date < pd.Timestamp('2026-07-01'):
-                        stamp = '2026-05-22' if restated else '2020-04-02'
-                    else:
-                        stamp = str(date.date())
-                    rows.append({'ticker': ticker, 'date': date.date(),
-                                 'marketcap': 1.0,
-                                 'lastupdated': pd.Timestamp(stamp).date()})
-            return pd.DataFrame(rows)
-
+            if fail_probes and 'lastupdated' in filters:
+                raise NDLError('provider unavailable')
+            df = held
+            tickers = filters.get('ticker')
+            if tickers is not None:
+                tickers = [tickers] if isinstance(tickers, str) else tickers
+                df = df[df['ticker'].isin(tickers)]
+            for col in ('date', 'lastupdated'):
+                bounds = filters.get(col, {})
+                if 'gte' in bounds:
+                    df = df[df[col] >= pd.Timestamp(bounds['gte']).date()]
+                if 'lte' in bounds:
+                    df = df[df[col] <= pd.Timestamp(bounds['lte']).date()]
+            return df.reset_index(drop=True)
         return get_table
 
-    def fill_then_query_next_day(self, restated):
-        """Cache a historical slice, then re-query it a day later."""
-        calls = []
-        with patch.object(AsyncNDLClient, 'get_table', self.mock(calls)):
-            query(DAILY, ticker='AAPL',
-                  date_gte=self.HELD[0], date_lte=self.HELD[1])
-
+    @staticmethod
+    def a_day_passes():
         conn = duckdb.connect(get_db_path())
         conn.execute('UPDATE sharadar_daily_sync_bounds '
                      'SET last_staleness_check = last_staleness_check '
                      '- INTERVAL 1 DAY')
         conn.close()
 
-        calls.clear()
+    def fill(self, held):
+        with patch.object(AsyncNDLClient, 'get_table', self.serve(held, [])):
+            query(DAILY, ticker='AAPL',
+                  date_gte=self.HELD[0], date_lte=self.HELD[1])
+
+    def requery(self, held, calls=None, fail_probes=False):
+        calls = [] if calls is None else calls
+        with patch.object(AsyncNDLClient, 'get_table',
+                          self.serve(held, calls, fail_probes)):
+            return query(DAILY, ticker='AAPL',
+                         date_gte=self.HELD[0], date_lte=self.HELD[1])
+
+    @staticmethod
+    def today():
+        return pd.Timestamp.now().normalize().date()
+
+    def test_a_quiet_day_fetches_no_rows(self, use_temp_db):
+        held = self.provider()
+        self.fill(held)
+        self.a_day_passes()
+        calls = []
         dropped = []
         original = _CacheManager._invalidate_ticker
 
@@ -985,36 +1000,112 @@ class TestStalenessCheck:
             dropped.append(ticker)
             return await original(self, ticker)
 
-        with patch.object(AsyncNDLClient, 'get_table',
-                          self.mock(calls, restated=restated)), \
-                patch.object(_CacheManager, '_invalidate_ticker', track):
-            query(DAILY, ticker='AAPL',
-                  date_gte=self.HELD[0], date_lte=self.HELD[1])
-        return calls, dropped
-
-    def test_a_historical_slice_is_not_thrown_away_daily(self, use_temp_db):
-        # The provider always holds rows newer than a historical cache does,
-        # stamped more recently. Taking the watermark over all of history
-        # therefore said "stale" every day, and the whole ticker was deleted
-        # and refetched on the first query of each one.
-        _, dropped = self.fill_then_query_next_day(restated=False)
+        with patch.object(_CacheManager, '_invalidate_ticker', track):
+            self.requery(held, calls)
+        # One probe, asking only for what changed, which was nothing. Asking
+        # for the whole history cost a hundred pages a check.
+        assert [c for c in calls if 'lastupdated' in c], calls
+        assert all('lastupdated' in c for c in calls), calls
         assert dropped == []
 
-    def test_the_watermark_is_read_from_a_short_window(self, use_temp_db):
-        # Reading it from the whole history cost a hundred pages per check.
-        calls, _ = self.fill_then_query_next_day(restated=False)
-        spans = [(c['date']['gte'], c['date']['lte'])
-                 for c in calls if 'date' in c]
-        assert len(spans) == len(calls), 'every request must be date bounded'
-        widest = max((pd.Timestamp(hi) - pd.Timestamp(lo)).days
-                     for lo, hi in spans)
-        assert widest < 7
+    def test_a_correction_years_back_is_written_over_the_cached_row(
+            self, use_temp_db):
+        held = self.provider()
+        self.fill(held)
+        fixed = held['date'] == pd.Timestamp('2020-02-14').date()
+        held.loc[fixed, ['marketcap', 'lastupdated']] = [2.0, self.today()]
+        self.a_day_passes()
+        df = self.requery(held)
+        assert df.loc[('AAPL', pd.Timestamp('2020-02-14')), 'marketcap'] == 2.0
+        assert (df['marketcap'] == 1.0).sum() == len(df) - 1
 
-    def test_a_real_restatement_still_invalidates(self, use_temp_db):
-        # The point of the check: when the settled history is rewritten, the
-        # cached copy is wrong and has to go.
-        _, dropped = self.fill_then_query_next_day(restated=True)
-        assert dropped == ['AAPL']
+    def test_a_restatement_replaces_every_row(self, use_temp_db):
+        held = self.provider()
+        self.fill(held)
+        held[['marketcap', 'lastupdated']] = [3.0, self.today()]
+        self.a_day_passes()
+        df = self.requery(held)
+        assert (df['marketcap'] == 3.0).all()
+
+    def test_a_failed_check_is_not_recorded_and_says_so(self, use_temp_db):
+        held = self.provider()
+        self.fill(held)
+        self.a_day_passes()
+        held.loc[held.index[10], ['marketcap', 'lastupdated']] = [2.0,
+                                                                self.today()]
+        with pytest.warns(UserWarning, match='staleness check failed'):
+            df = self.requery(held, fail_probes=True)
+        assert (df['marketcap'] == 1.0).all()
+        # The next query asks again, from the same day, and finds the fix.
+        df = self.requery(held)
+        assert (df['marketcap'] == 2.0).sum() == 1
+
+    def test_a_later_fetch_does_not_vouch_for_rows_it_did_not_fetch(
+            self, use_temp_db):
+        held = self.provider()
+        self.fill(held)
+        self.a_day_passes()
+        held.loc[held.index[10], ['marketcap', 'lastupdated']] = [2.0,
+                                                                self.today()]
+        # The check fails, and the same query fetches a range not yet held,
+        # which once marked the whole ticker checked.
+        with pytest.warns(UserWarning):
+            with patch.object(AsyncNDLClient, 'get_table',
+                              self.serve(held, [], fail_probes=True)):
+                query(DAILY, ticker='AAPL',
+                      date_gte=self.HELD[0], date_lte='2020-06-30')
+        df = self.requery(held)
+        assert (df['marketcap'] == 2.0).sum() == 1
+
+    def test_a_stamp_from_the_day_before_the_check_is_still_caught(
+            self, use_temp_db):
+        # The check's date is this machine's and the stamp is the provider's,
+        # so around midnight a change made after the check can carry the
+        # previous day's date.
+        held = self.provider()
+        self.fill(held)
+        self.a_day_passes()
+        yesterday_but_one = (pd.Timestamp(self.today())
+                             - pd.Timedelta(days=2)).date()
+        held.loc[held.index[10], ['marketcap', 'lastupdated']] = [
+            2.0, yesterday_but_one]
+        df = self.requery(held)
+        assert (df['marketcap'] == 2.0).sum() == 1
+
+    def test_tickers_held_over_different_ranges_share_one_request(
+            self, use_temp_db):
+        held = pd.concat([
+            self.provider(),
+            self.provider().assign(ticker='MSFT'),
+        ])
+        with patch.object(AsyncNDLClient, 'get_table', self.serve(held, [])):
+            query(DAILY, ticker='AAPL', date_gte='2020-01-01',
+                  date_lte='2020-03-31')
+            query(DAILY, ticker='MSFT', date_gte='2020-02-03',
+                  date_lte='2020-06-30')
+        self.a_day_passes()
+        calls = []
+        with patch.object(AsyncNDLClient, 'get_table',
+                          self.serve(held, calls)):
+            query(DAILY, ticker=['AAPL', 'MSFT'], date_gte='2020-02-03',
+                  date_lte='2020-03-31')
+        assert len([c for c in calls if 'lastupdated' in c]) == 1, calls
+
+    def test_an_older_copy_never_overwrites_a_newer_one(self, use_temp_db):
+        held = self.provider()
+        self.fill(held)
+        newer = held.copy()
+        newer[['marketcap', 'lastupdated']] = [5.0, self.today()]
+        self.a_day_passes()
+        self.requery(newer)
+        # A fetch that began before the restatement lands after it.
+        async def write_old():
+            async with _CacheManager(DAILY) as mgr:
+                cols = ['ticker', 'date', 'marketcap', 'lastupdated']
+                await mgr._store(held[cols], cols)
+        asyncio.run(write_old())
+        df = self.requery(newer)
+        assert (df['marketcap'] == 5.0).all()
 
 
 class TestCoverageRecordsWhatWasAsked:

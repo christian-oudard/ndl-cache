@@ -5,6 +5,7 @@ Provides async_query() for async access and query() for sync access.
 """
 import asyncio
 import os
+import warnings
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -34,11 +35,6 @@ NDL_SPLIT_THRESHOLD = 9000
 # failed". Most servers cap the request line near 8 KB, so budget the ticker
 # list well under that to leave room for the other parameters.
 MAX_TICKER_PARAM_CHARS = 3000
-
-# How many days at the end of a ticker's cached range to ask about when
-# checking whether the provider has restated it. Wide enough to contain a
-# trading day across a weekend and a holiday.
-PROBE_DAYS = 7
 
 # Ticker cap for tables whose row density is unknown, so that one request
 # cannot run past the page limit. SF1 is about 600 rows per ticker across all
@@ -371,13 +367,16 @@ class _CacheManager:
             new_to = effective_to
             new_max_lastupdated = max_lastupdated
 
+        # Only a new ticker is stamped checked, since everything held for it
+        # was just fetched. A fetch extending an older range vouches for the
+        # rows it fetched, not for the rest, so the check date stays put.
         today = datetime.now().strftime('%Y-%m-%d')
         if existing:
             await conn.execute(f"""
                 UPDATE {self.table.sync_bounds_table_name()}
-                SET synced_from = ?, synced_to = ?, max_lastupdated = ?, last_staleness_check = ?
+                SET synced_from = ?, synced_to = ?, max_lastupdated = ?
                 WHERE ticker = ?
-            """, [new_from, new_to, new_max_lastupdated, today, ticker])
+            """, [new_from, new_to, new_max_lastupdated, ticker])
         else:
             await conn.execute(f"""
                 INSERT INTO {self.table.sync_bounds_table_name()}
@@ -440,117 +439,99 @@ class _CacheManager:
             WHERE ticker = ?
         """, [ticker])
 
-    async def _probe_windows(self, tickers: list[str],
-                             sync_bounds: dict) -> dict[tuple[str, str], list[str]]:
+    async def _refresh_stale(self, tickers: list[str]):
         """
-        The date window to ask the provider about, per group of tickers.
+        Write over cached rows the provider has rewritten since this cache
+        last asked, and drop tickers whose symbol no longer exists.
 
-        Sharadar restates a ticker by rewriting `lastupdated` on every row it
-        holds for that ticker: MSFT carries one single value, 2026-05-21,
-        across 1999 to 2024. Reading the watermark therefore does not need the
-        whole history, which is what made this check cost a hundred pages. A
-        few days at the end of what is cached carries the same value.
+        Sharadar stamps each row it rewrites with a new `lastupdated`: a
+        restatement stamps a ticker's whole history, a correction only the
+        rows it fixed, which can lie years back. So the check asks, across the
+        whole cached range, for the rows stamped since the day before it last
+        asked, which on a quiet day is none. A day early, because the check's
+        date is this machine's and a stamp is the provider's, and around
+        midnight the two can differ by one.
 
-        Tickers are grouped by the window so that the usual case, where every
-        ticker was synced to the same date, is one request.
-        """
-        windows: dict[tuple[str, str], list[str]] = {}
-        for ticker in tickers:
-            bounds = sync_bounds[ticker]
-            synced_to = bounds.get('synced_to')
-            synced_from = bounds.get('synced_from')
-            if not synced_to:
-                continue
-            start = (datetime.strptime(synced_to, '%Y-%m-%d')
-                     - timedelta(days=PROBE_DAYS - 1)).strftime('%Y-%m-%d')
-            if synced_from:
-                start = max(start, synced_from)
-            windows.setdefault((start, synced_to), []).append(ticker)
-        return windows
-
-    async def _cached_watermarks(self, tickers: list[str], start: str,
-                                 end: str) -> dict[str, str]:
-        """Highest lastupdated this cache holds per ticker over a window."""
-        conn = await self._get_conn()
-        date_col = self.table.date_column
-        placeholders = ', '.join(['?'] * len(tickers))
-        cursor = await conn.execute(f"""
-            SELECT ticker, MAX(lastupdated) FROM {self.table.safe_table_name()}
-            WHERE ticker IN ({placeholders})
-              AND {_quote(date_col)} BETWEEN ? AND ?
-            GROUP BY ticker
-        """, [*tickers, start, end])
-        return {t: str(lu)[:10] for t, lu in await cursor.fetchall() if lu}
-
-    async def _check_and_invalidate_stale(self, tickers: list[str]):
-        """Check if cached data is stale and invalidate if needed.
-
-        Compares the provider's `lastupdated` watermark against this cache's
-        own, over the same narrow window at the end of what is held, so that
-        the two are like for like and neither side reads the whole history.
+        A check that fails is not recorded, so the next query asks again from
+        the same day and no correction is skipped.
         """
         if not tickers:
             return
 
         today = datetime.now().strftime('%Y-%m-%d')
         sync_bounds = await self._get_sync_bounds(tickers)
-
-        tickers_to_check = []
-        for ticker in tickers:
-            bounds = sync_bounds.get(ticker)
-            if bounds is None:
-                continue
-            last_check = bounds.get('last_staleness_check')
-            if last_check == today:
-                continue
-            tickers_to_check.append(ticker)
-
-        if not tickers_to_check:
+        due = [t for t in tickers if sync_bounds.get(t) is not None
+               and sync_bounds[t].get('last_staleness_check') != today]
+        if not due:
             return
 
         # ACTIONS has no lastupdated column at all, and asking for one is a
-        # 403 rather than an empty result, so there is nothing to probe with.
+        # 403 rather than an empty result, so there is nothing to ask with.
         # Its rows are therefore cached and never refreshed; see IMPROVEMENTS.
         if (self.table.date_column is None
                 or 'lastupdated' not in self.table.query_columns
                 or not await self._data_table_exists()):
-            await self._mark_checked(tickers_to_check, today)
+            await self._mark_checked(due, today)
             return
 
+        # One request per check date, which is the usual case for a set of
+        # tickers fetched together, over the span of all their ranges. Rows
+        # outside a ticker's own range are dropped below.
+        groups: dict[str, list[str]] = {}
+        for ticker in due:
+            bounds = sync_bounds[ticker]
+            checked = bounds.get('last_staleness_check')
+            since = ((datetime.strptime(checked, '%Y-%m-%d')
+                      - timedelta(days=1)).strftime('%Y-%m-%d')
+                     if checked else bounds['synced_from'])
+            groups.setdefault(since, []).append(ticker)
+
         client = await self._get_ndl_client()
-        stale_tickers = []
+        date_col = self.table.date_column
+        fetched = []
+        try:
+            async with self._unlocked():
+                for since, group in groups.items():
+                    start = min(sync_bounds[t]['synced_from'] for t in group)
+                    end = max(sync_bounds[t]['synced_to'] for t in group)
+                    per_url = self._tickers_per_url(group)
+                    for i in range(0, len(group), per_url):
+                        fetched.append(await client.get_table(
+                            self.table.name,
+                            columns=self.table.all_columns,
+                            ticker=group[i:i + per_url],
+                            paginate=True,
+                            **{date_col: {'gte': start, 'lte': end},
+                               'lastupdated': {'gte': since}},
+                        ))
+        except NDLError as e:
+            warnings.warn(
+                f'{self.table.name}: staleness check failed for '
+                f'{len(due)} tickers, so cached rows may be out of date; the '
+                f'next query checks again. {e!r}')
+            return
 
-        for (start, end), group in (
-                await self._probe_windows(tickers_to_check, sync_bounds)).items():
-            date_col = self.table.date_column
-            try:
-                async with self._unlocked():
-                    df = await client.get_table(
-                        self.table.name,
-                        columns=['ticker', 'lastupdated'],
-                        ticker=group,
-                        paginate=True,
-                        **{date_col: {'gte': start, 'lte': end}},
-                    )
-            except Exception:
-                # On error, skip staleness check but still update last_staleness_check
-                continue
+        changed = [df for df in fetched if len(df) > 0]
+        if changed:
+            changed = pd.concat(changed, ignore_index=True)
+            dates = pd.to_datetime(changed[date_col]).dt.strftime('%Y-%m-%d')
+            held_from = changed['ticker'].map(
+                lambda t: sync_bounds[t]['synced_from'])
+            held_to = changed['ticker'].map(
+                lambda t: sync_bounds[t]['synced_to'])
+            changed = changed[(dates >= held_from) & (dates <= held_to)]
+            data_columns = [c for c in self.table.query_columns
+                            if c in changed.columns]
+            cols = list(self.table.index_columns) + data_columns
+            await self._ensure_data_table(data_columns)
+            await self._store(changed[cols].drop_duplicates(
+                subset=list(self.table.index_columns)), cols)
 
-            if len(df) == 0 or 'lastupdated' not in df.columns:
-                continue
-            api = df.groupby('ticker')['lastupdated'].max()
-            cached = await self._cached_watermarks(group, start, end)
-            for ticker, api_lu in api.items():
-                cached_lu = cached.get(ticker)
-                if pd.notna(api_lu) and cached_lu and str(api_lu)[:10] > cached_lu:
-                    stale_tickers.append(ticker)
+        # Recorded for every ticker asked about, including ones with nothing
+        # new, so the check is not repeated within the day.
+        await self._mark_checked(due, today)
 
-        # Recorded for every ticker looked at, including ones the provider had
-        # nothing to say about, so a check is not repeated within the day.
-        await self._mark_checked(tickers_to_check, today)
-
-        for ticker in set(stale_tickers) | set(
-                await self._renamed_away(tickers_to_check)):
+        for ticker in await self._renamed_away(due):
             await self._invalidate_ticker(ticker)
 
     async def _mark_checked(self, tickers: list[str], today: str):
@@ -1054,13 +1035,27 @@ class _CacheManager:
         """
         Merge a frame into the data table.
 
-        INSERT OR REPLACE because parallel fetches and retries overlap, and
-        the same row can legitimately arrive twice.
+        Parallel fetches and retries overlap, and the same row can arrive
+        twice. Where rows carry `lastupdated`, a row is only replaced by one
+        stamped as recently or later, so a fetch that began before a
+        restatement and lands after it cannot put the old values back.
         """
+        name = self.table.safe_table_name()
+        index = list(self.table.index_columns)
+        updates = [c for c in cols if c not in index]
+        if 'lastupdated' in cols and updates:
+            sql = (f'INSERT INTO {name} ({_columns(cols)}) '
+                   f'SELECT {_columns(cols)} FROM _incoming '
+                   f'ON CONFLICT ({_columns(index)}) DO UPDATE SET '
+                   + ', '.join(f'{_quote(c)} = excluded.{_quote(c)}'
+                               for c in updates)
+                   + ' WHERE lastupdated IS NULL '
+                     'OR CAST(excluded.lastupdated AS DATE) >= lastupdated')
+        else:
+            sql = (f'INSERT OR REPLACE INTO {name} ({_columns(cols)}) '
+                   f'SELECT {_columns(cols)} FROM _incoming')
         async with self._staged(store_df) as conn:
-            await conn.execute_on_self(
-                f'INSERT OR REPLACE INTO {self.table.safe_table_name()} '
-                f'({_columns(cols)}) SELECT {_columns(cols)} FROM _incoming')
+            await conn.execute_on_self(sql)
 
     async def _full_synced_at(self) -> str | None:
         """When the whole table was last replaced, or None if never."""
@@ -1262,7 +1257,7 @@ class _CacheManager:
                     await self.get_cached(**filters), columns)
 
             if tickers:
-                await self._check_and_invalidate_stale(tickers)
+                await self._refresh_stale(tickers)
 
             if self.table.date_column is None:
                 if tickers:
